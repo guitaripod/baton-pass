@@ -138,20 +138,28 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
         let mut counter = crate::crypto::Counter::new();
         let mut frame = |msg: Msg| cipher.seal(&crate::proto::Envelope { token, counter: counter.next(), msg }.encode());
         let saved = super::clipboard::exchange(&cipher, peer, frame(Msg::ClipGet { have: [0; 32] }), token).await?;
-        let test = ("text/plain;charset=utf-8".to_string(), text.clone().into_bytes());
-        let put = Msg::ClipPut { mime: test.0.clone(), data: test.1.clone() };
+        let test: crate::clip::Clip = vec![
+            (crate::clip::HTML.to_string(), format!("<b>{text}</b>").into_bytes()),
+            (crate::clip::TEXT.to_string(), text.clone().into_bytes()),
+        ];
+        let put = Msg::ClipPut { clip: test.clone() };
         let started = Instant::now();
         super::clipboard::exchange(&cipher, peer, frame(put), token).await?;
         println!("put {text:?} on the Mac clipboard in {} ms", started.elapsed().as_millis());
-        let have = super::clipboard::digest(&test);
+        let back = super::clipboard::exchange(&cipher, peer, frame(Msg::ClipGet { have: [0; 32] }), token).await?;
+        match &back.msg {
+            Msg::ClipData { clip, .. } => println!("the Mac now offers {}", crate::clip::describe(clip)),
+            _ => println!("the Mac offered nothing back"),
+        }
+        let have = crate::clip::digest(&test);
         let again = super::clipboard::exchange(&cipher, peer, frame(Msg::ClipGet { have }), token).await?;
         println!(
             "asking again with its digest returns {}",
             if matches!(again.msg, Msg::ClipNone { .. }) { "nothing (unchanged)" } else { "data" }
         );
         let restore = match saved.msg {
-            Msg::ClipData { mime, data, .. } => Msg::ClipPut { mime, data },
-            _ => Msg::ClipPut { mime: test.0, data: Vec::new() },
+            Msg::ClipData { clip, .. } => Msg::ClipPut { clip },
+            _ => Msg::ClipPut { clip: vec![(crate::clip::TEXT.to_string(), Vec::new())] },
         };
         super::clipboard::exchange(&cipher, peer, frame(restore), token).await?;
         println!("restored the Mac clipboard");

@@ -10,6 +10,7 @@ mod tray;
 #[cfg(test)]
 mod harness;
 
+use crate::clip;
 use crate::config::{Config, Side};
 use crate::crypto::{Cipher, Counter};
 use crate::proto::{Envelope, Msg};
@@ -911,6 +912,7 @@ fn slam_plans(side: Side, edges: &[Edge], position: Option<(f64, f64)>) -> Vec<O
 /// Runs clipboard transfers one at a time so their counters reach the Mac in order. `synced` is
 /// the digest of the last content that crossed in either direction, so nothing is sent twice.
 async fn clipboard_worker(cipher: Rc<Cipher>, mut jobs: mpsc::UnboundedReceiver<ClipJob>) {
+    let clipboard = clipboard::Clipboard::new();
     let mut counter = Counter::new();
     let mut synced: Option<[u8; 32]> = None;
     while let Some(job) = jobs.recv().await {
@@ -920,35 +922,38 @@ async fn clipboard_worker(cipher: Rc<Cipher>, mut jobs: mpsc::UnboundedReceiver<
                     let _ = done.send(());
                 }
                 ClipJob::Push { peer, token } => {
-                    let Some(content) = clipboard::read().await? else { return Ok(()) };
-                    let hash = clipboard::digest(&content);
+                    if clipboard.holds_ours() {
+                        return Ok(());
+                    }
+                    let Some(content) = clipboard.read().await? else { return Ok(()) };
+                    let request = counter.next();
+                    let (hash, frame) = seal_off_loop(&cipher, token, request, content.clone()).await?;
                     if synced == Some(hash) {
                         return Ok(());
                     }
-                    let request = counter.next();
-                    let msg = Msg::ClipPut { mime: content.0, data: content.1 };
-                    let frame = cipher.seal(&Envelope { token, counter: request, msg }.encode());
                     match clipboard::exchange(&cipher, peer, frame, token).await?.msg {
-                        Msg::ClipNone { echo } if echo == request => synced = Some(hash),
+                        Msg::ClipNone { echo } if echo == request => {
+                            synced = Some(hash);
+                            tracing::info!("clipboard to the Mac: {}", clip::describe(&content));
+                        }
                         _ => anyhow::bail!("the Mac did not take the clipboard"),
                     }
                 }
                 ClipJob::Pull { peer, token } => {
-                    let before = clipboard::read().await?.map(|content| clipboard::digest(&content));
+                    let before = clipboard.read().await?.map(|content| clip::digest(&content));
                     let request = counter.next();
                     let msg = Msg::ClipGet { have: synced.unwrap_or([0; 32]) };
                     let frame = cipher.seal(&Envelope { token, counter: request, msg }.encode());
                     match clipboard::exchange(&cipher, peer, frame, token).await?.msg {
-                        Msg::ClipData { echo, mime, data } if echo == request => {
-                            let now = clipboard::read().await?.map(|content| clipboard::digest(&content));
+                        Msg::ClipData { echo, clip: content } if echo == request => {
+                            let now = clipboard.read().await?.map(|content| clip::digest(&content));
                             if now != before {
                                 tracing::info!("kept this desktop's clipboard: it changed while the Mac's was on its way");
                                 return Ok(());
                             }
-                            let content = (mime, data);
-                            clipboard::write(&content).await?;
-                            synced = Some(clipboard::digest(&content));
-                            tracing::info!("clipboard from the Mac: {} ({} bytes)", content.0, content.1.len());
+                            clipboard.write(&content).await?;
+                            synced = Some(clip::digest(&content));
+                            tracing::info!("clipboard from the Mac: {}", clip::describe(&content));
                         }
                         Msg::ClipNone { echo } if echo == request => {}
                         _ => anyhow::bail!("unexpected clipboard reply"),
@@ -962,6 +967,18 @@ async fn clipboard_worker(cipher: Rc<Cipher>, mut jobs: mpsc::UnboundedReceiver<
             tracing::warn!("clipboard sync: {error:#}");
         }
     }
+}
+
+/// Hashes and seals a clipboard on a blocking thread: up to 32 MB of work that would
+/// otherwise hold the event loop and delay input.
+async fn seal_off_loop(cipher: &Cipher, token: u64, counter: u64, content: clip::Clip) -> Result<([u8; 32], Vec<u8>)> {
+    let cipher = cipher.clone();
+    Ok(tokio::task::spawn_blocking(move || {
+        let hash = clip::digest(&content);
+        let frame = cipher.seal(&Envelope { token, counter, msg: Msg::ClipPut { clip: content } }.encode());
+        (hash, frame)
+    })
+    .await?)
 }
 
 #[cfg(test)]

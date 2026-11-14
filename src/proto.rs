@@ -1,3 +1,4 @@
+use crate::clip::Clip;
 pub const MAX_KEYS: usize = 32;
 pub const MAX_CLIPBOARD: usize = 32 * 1024 * 1024;
 
@@ -30,9 +31,9 @@ pub enum Msg {
     Pointer { dx: f32, dy: f32, wheel_v: i32, wheel_h: i32, buttons: u32 },
     Keys(KeyState),
     Exit { frac: f32 },
-    ClipPut { mime: String, data: Vec<u8> },
+    ClipPut { clip: Clip },
     ClipGet { have: [u8; 32] },
-    ClipData { echo: u64, mime: String, data: Vec<u8> },
+    ClipData { echo: u64, clip: Clip },
     ClipNone { echo: u64 },
 }
 
@@ -97,20 +98,18 @@ impl Envelope {
                 out.push(9);
                 out.extend_from_slice(&frac.to_le_bytes());
             }
-            Msg::ClipPut { mime, data } => {
-                out.push(10);
-                put_blob(&mut out, mime.as_bytes());
-                put_blob(&mut out, data);
+            Msg::ClipPut { clip } => {
+                out.push(16);
+                put_blob(&mut out, &crate::clip::encode(clip));
             }
             Msg::ClipGet { have } => {
                 out.push(11);
                 out.extend_from_slice(have);
             }
-            Msg::ClipData { echo, mime, data } => {
-                out.push(12);
+            Msg::ClipData { echo, clip } => {
+                out.push(17);
                 out.extend_from_slice(&echo.to_le_bytes());
-                put_blob(&mut out, mime.as_bytes());
-                put_blob(&mut out, data);
+                put_blob(&mut out, &crate::clip::encode(clip));
             }
             Msg::ClipNone { echo } => {
                 out.push(13);
@@ -155,9 +154,9 @@ impl Envelope {
             },
             8 => Msg::Keys(reader.keys()?),
             9 => Msg::Exit { frac: reader.f32()? },
-            10 => Msg::ClipPut { mime: reader.text()?, data: reader.blob()? },
+            16 => Msg::ClipPut { clip: crate::clip::decode(&reader.blob()?)? },
             11 => Msg::ClipGet { have: reader.take(32)?.try_into().ok()? },
-            12 => Msg::ClipData { echo: reader.u64()?, mime: reader.text()?, data: reader.blob()? },
+            17 => Msg::ClipData { echo: reader.u64()?, clip: crate::clip::decode(&reader.blob()?)? },
             13 => Msg::ClipNone { echo: reader.u64()? },
             14 => Msg::Challenge { nonce: reader.u64()?, challenge: reader.u64()? },
             15 => Msg::Join { nonce: reader.u64()?, challenge: reader.u64()? },
@@ -239,9 +238,6 @@ impl Reader<'_> {
         Some(self.take(length)?.to_vec())
     }
 
-    fn text(&mut self) -> Option<String> {
-        String::from_utf8(self.blob()?).ok()
-    }
 }
 
 #[cfg(test)]
@@ -268,9 +264,9 @@ mod tests {
         round_trip(Msg::Pointer { dx: -3.5, dy: 2.25, wheel_v: -120, wheel_h: 60, buttons: 1 });
         round_trip(Msg::Keys(keys));
         round_trip(Msg::Exit { frac: 0.5 });
-        round_trip(Msg::ClipPut { mime: "text/plain;charset=utf-8".into(), data: "hej".into() });
+        round_trip(Msg::ClipPut { clip: vec![("text/html".into(), "<i>hej</i>".into()), ("text/plain;charset=utf-8".into(), "hej".into())] });
         round_trip(Msg::ClipGet { have: [5; 32] });
-        round_trip(Msg::ClipData { echo: 3, mime: "image/png".into(), data: vec![1, 2, 3] });
+        round_trip(Msg::ClipData { echo: 3, clip: vec![("image/png".into(), vec![1, 2, 3])] });
         round_trip(Msg::ClipNone { echo: 3 });
     }
 

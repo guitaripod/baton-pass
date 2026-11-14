@@ -3,13 +3,13 @@ mod linear;
 pub mod pasteboard;
 mod vhid;
 
+use crate::clip;
 use crate::config::{Confine, Config, Side};
 use crate::crypto::{Cipher, Counter};
 use crate::session::{Admission, Doorman, Silence};
 use crate::proto::{Envelope, FLAG_ENTERED, KeyState, MAX_CLIPBOARD, Msg};
 use anyhow::{Context, Result, bail};
 use display::{Point, Rect};
-use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -59,6 +59,7 @@ struct Gate {
     tcp_counter: u64,
     counter: Counter,
     clipboard_busy: bool,
+    written_change: Option<i64>,
 }
 
 struct Receiver {
@@ -103,6 +104,7 @@ pub async fn run(config: Config) -> Result<()> {
         tcp_counter: 0,
         counter: Counter::new(),
         clipboard_busy: false,
+        written_change: None,
     }));
     let mut receiver = Receiver {
         socket,
@@ -819,16 +821,22 @@ async fn serve_clipboard(mut stream: TcpStream, cipher: Rc<Cipher>, gate: Rc<Ref
         }
         let (token, echo) = (envelope.token, envelope.counter);
         let reply = match envelope.msg {
-            Msg::ClipPut { mime, data } => {
-                let content = (mime, data);
-                pasteboard::write(&content).await?;
-                tracing::info!("clipboard to the Mac: {} ({} bytes)", content.0, content.1.len());
+            Msg::ClipPut { clip: content } => {
+                let change = pasteboard::write(&content).await?;
+                gate.borrow_mut().written_change = Some(change);
+                tracing::info!("clipboard to the Mac: {}", clip::describe(&content));
                 Msg::ClipNone { echo }
             }
-            Msg::ClipGet { have } => match pasteboard::read().await? {
-                Some(content) if digest(&content) != have => Msg::ClipData { echo, mime: content.0, data: content.1 },
-                _ => Msg::ClipNone { echo },
-            },
+            Msg::ClipGet { have } => {
+                let written = gate.borrow().written_change;
+                match pasteboard::read().await? {
+                    Some((change, content)) if Some(change) != written && !content.is_empty() && clip::digest(&content) != have => {
+                        tracing::info!("clipboard from the Mac: {}", clip::describe(&content));
+                        Msg::ClipData { echo, clip: content }
+                    }
+                    _ => Msg::ClipNone { echo },
+                }
+            }
             _ => unreachable!("checked above"),
         };
         let counter = gate.borrow_mut().counter.next();
@@ -856,13 +864,6 @@ async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-fn digest(content: &pasteboard::Content) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(content.0.as_bytes());
-    hasher.update([0]);
-    hasher.update(&content.1);
-    hasher.finalize().into()
-}
 
 #[cfg(test)]
 mod tests {

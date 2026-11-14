@@ -1,3 +1,4 @@
+mod clip;
 mod config;
 mod crypto;
 mod proto;
@@ -46,10 +47,7 @@ enum Command {
     ClipGet,
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
-    ClipSet {
-        #[arg(long)]
-        mime: String,
-    },
+    ClipSet,
 }
 
 fn main() -> Result<()> {
@@ -94,6 +92,6 @@ fn main() -> Result<()> {
         #[cfg(target_os = "macos")]
         Command::ClipGet => macos::pasteboard::helper_get(),
         #[cfg(target_os = "macos")]
-        Command::ClipSet { mime } => macos::pasteboard::helper_set(&mime),
+        Command::ClipSet => macos::pasteboard::helper_set(),
     }
 }

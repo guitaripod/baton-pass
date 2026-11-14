@@ -1,49 +1,147 @@
+use crate::clip::{self, Clip, FILES, HTML, PNG, RTF, TEXT};
 use crate::crypto::Cipher;
 use crate::proto::{Envelope, MAX_CLIPBOARD};
 use anyhow::{Context, Result, anyhow, bail};
-use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::net::SocketAddr;
-use std::process::Stdio;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::process::Command;
+use wl_clipboard_rs::{copy, paste};
 
-const TEXT: &str = "text/plain;charset=utf-8";
-const PNG: &str = "image/png";
 const TIMEOUT: Duration = Duration::from_secs(5);
+const TEXT_TYPES: [&str; 5] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"];
+const RTF_TYPES: [&str; 2] = ["text/rtf", "application/rtf"];
 
-pub type Content = (String, Vec<u8>);
-
-pub fn digest(content: &Content) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(content.0.as_bytes());
-    hasher.update([0]);
-    hasher.update(&content.1);
-    hasher.finalize().into()
+/// The desktop clipboard, read and written over Wayland's data-control protocol.
+pub struct Clipboard {
+    serving: Arc<AtomicBool>,
 }
 
-/// Reads the Wayland clipboard, preferring whichever of PNG or text the source offered first.
-pub async fn read() -> Result<Option<Content>> {
-    let listing = run_wl_paste(&["--list-types"]).await?;
-    let Some(listing) = listing else { return Ok(None) };
-    let listing = String::from_utf8_lossy(&listing);
-    let chosen = listing.lines().map(str::trim).find_map(|offered| match offered {
-        PNG => Some((offered.to_string(), PNG)),
-        "text/plain;charset=utf-8" | "UTF8_STRING" | "text/plain" | "STRING" | "TEXT" => {
-            Some((offered.to_string(), TEXT))
+impl Clipboard {
+    pub fn new() -> Self {
+        Self { serving: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// True while the clipboard still holds what ferry last put there, so there is nothing new
+    /// to carry over.
+    pub fn holds_ours(&self) -> bool {
+        self.serving.load(Ordering::Acquire)
+    }
+
+    /// Reads every format ferry carries from the clipboard; files come along as a bundle.
+    pub async fn read(&self) -> Result<Option<Clip>> {
+        tokio::time::timeout(TIMEOUT, tokio::task::spawn_blocking(read_blocking))
+            .await
+            .context("reading the clipboard timed out")?
+            .context("clipboard reader")?
+    }
+
+    /// Offers `clip` on the clipboard in every format it carries, served from a thread until
+    /// something else is copied.
+    pub async fn write(&self, clip: &Clip) -> Result<()> {
+        let sources = sources(clip);
+        if sources.is_empty() {
+            return Ok(());
         }
-        _ => None,
-    });
-    let Some((offered, mime)) = chosen else { return Ok(None) };
-    let Some(data) = run_wl_paste(&["--no-newline", "--type", &offered]).await? else {
-        return Ok(None);
+        let (ready, prepared) = tokio::sync::oneshot::channel();
+        let serving = self.serving.clone();
+        std::thread::Builder::new().name("ferry-clipboard".into()).spawn(move || {
+            let mut options = copy::Options::new();
+            options.foreground(true);
+            match options.prepare_copy_multi(sources) {
+                Ok(copy) => {
+                    serving.store(true, Ordering::Release);
+                    let _ = ready.send(Ok(()));
+                    if let Err(error) = copy.serve() {
+                        tracing::debug!("serving the clipboard: {error}");
+                    }
+                    serving.store(false, Ordering::Release);
+                }
+                Err(error) => {
+                    let _ = ready.send(Err(anyhow!(error)));
+                }
+            }
+        })?;
+        tokio::time::timeout(TIMEOUT, prepared).await.context("setting the clipboard timed out")?.context("clipboard writer")?
+    }
+}
+
+fn sources(clip: &Clip) -> Vec<copy::MimeSource> {
+    let mut sources = Vec::new();
+    for (mime, data) in clip {
+        let source = || copy::Source::Bytes(data.clone().into_boxed_slice());
+        match mime.as_str() {
+            TEXT => sources.push(copy::MimeSource { source: source(), mime_type: copy::MimeType::Text }),
+            HTML | PNG => sources.push(copy::MimeSource { source: source(), mime_type: copy::MimeType::Specific(mime.clone()) }),
+            RTF => {
+                for rtf in RTF_TYPES {
+                    sources.push(copy::MimeSource { source: source(), mime_type: copy::MimeType::Specific(rtf.into()) });
+                }
+            }
+            _ => {}
+        }
+    }
+    sources
+}
+
+fn read_blocking() -> Result<Option<Clip>> {
+    let offered = match paste::get_mime_types_ordered(paste::ClipboardType::Regular, paste::Seat::Unspecified) {
+        Ok(offered) => offered,
+        Err(paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => return Ok(None),
+        Err(error) => return Err(error).context("listing the clipboard's formats"),
     };
-    if data.is_empty() || data.len() > MAX_CLIPBOARD {
+    let has = |mime: &str| offered.iter().any(|offered| offered == mime);
+    let text_type = offered.iter().find(|offered| TEXT_TYPES.contains(&offered.as_str())).cloned();
+    let text = match &text_type {
+        Some(offered) => fetch(offered)?.map(|data| utf8_text(offered, data)),
+        None => None,
+    };
+    let mut clip: Clip = Vec::new();
+    if has("text/uri-list")
+        && let Some(list) = fetch("text/uri-list")?
+        && let Some(files) = files_from_uri_list(&String::from_utf8_lossy(&list))
+    {
+        clip.push((FILES.into(), files));
+    } else if has(PNG) {
+        if let Some(png) = fetch(PNG)? {
+            clip.push((PNG.into(), png));
+        }
+    } else {
+        if has(HTML)
+            && let Some(html) = fetch(HTML)?
+        {
+            clip.push((HTML.into(), html));
+        }
+        if let Some(rtf_type) = RTF_TYPES.iter().find(|rtf| has(rtf))
+            && let Some(rtf) = fetch(rtf_type)?
+        {
+            clip.push((RTF.into(), rtf));
+        }
+    }
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        clip.push((TEXT.into(), text));
+    }
+    if clip.is_empty() || clip::size(&clip) > MAX_CLIPBOARD {
         return Ok(None);
     }
-    let data = if mime == TEXT { utf8_text(&offered, data) } else { data };
-    Ok(Some((mime.to_string(), data)))
+    Ok(Some(clip))
+}
+
+fn fetch(mime: &str) -> Result<Option<Vec<u8>>> {
+    let (pipe, _) = match paste::get_contents(paste::ClipboardType::Regular, paste::Seat::Unspecified, paste::MimeType::Specific(mime)) {
+        Ok(contents) => contents,
+        Err(paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {mime} from the clipboard")),
+    };
+    let mut data = Vec::new();
+    pipe.take(MAX_CLIPBOARD as u64 + 1).read_to_end(&mut data)?;
+    Ok((!data.is_empty() && data.len() <= MAX_CLIPBOARD).then_some(data))
 }
 
 /// X11's STRING target is Latin-1; everything sent on is UTF-8.
@@ -57,38 +155,76 @@ fn utf8_text(offered: &str, data: Vec<u8>) -> Vec<u8> {
     }
 }
 
-async fn run_wl_paste(args: &[&str]) -> Result<Option<Vec<u8>>> {
-    let output = tokio::time::timeout(
-        TIMEOUT,
-        Command::new("wl-paste").args(args).stdin(Stdio::null()).kill_on_drop(true).output(),
-    )
-    .await
-    .context("wl-paste timed out")?
-    .context("running wl-paste")?;
-    Ok(output.status.success().then_some(output.stdout))
+/// Bundles the local files a file manager copied, folders included. Gives up (and the copy
+/// travels as text only) when an entry is not a local file or the files are too large.
+fn files_from_uri_list(list: &str) -> Option<Vec<u8>> {
+    let paths: Vec<PathBuf> = list
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(local_path)
+        .collect::<Option<_>>()?;
+    if paths.is_empty() {
+        return None;
+    }
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    for path in &paths {
+        let name = path.file_name()?.to_str()?.to_string();
+        collect(path, &name, &mut files, &mut total)?;
+    }
+    if files.is_empty() {
+        return None;
+    }
+    let bundle = clip::encode_files(&files);
+    (bundle.len() <= MAX_CLIPBOARD).then_some(bundle)
 }
 
-pub async fn write(content: &Content) -> Result<()> {
-    let mut child = Command::new("wl-copy")
-        .args(["--type", &content.0])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("running wl-copy")?;
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let output = tokio::time::timeout(TIMEOUT, async {
-        stdin.write_all(&content.1).await?;
-        drop(stdin);
-        child.wait_with_output().await
-    })
-    .await
-    .context("wl-copy timed out")??;
-    if !output.status.success() {
-        bail!("wl-copy failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+/// Adds `path` (a file, or a folder walked recursively) under the bundle name `name`.
+/// Symbolic links and special files are left out.
+fn collect(path: &Path, name: &str, files: &mut Vec<clip::File>, total: &mut usize) -> Option<()> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.is_file() {
+        *total += metadata.len() as usize;
+        if *total > MAX_CLIPBOARD {
+            tracing::info!("copied files are over {} MB; only their names go to the Mac", MAX_CLIPBOARD >> 20);
+            return None;
+        }
+        let data = std::fs::read(path).ok()?;
+        let executable = metadata.permissions().mode() & 0o111 != 0;
+        files.push(clip::File { path: name.to_string(), executable, data });
+    } else if metadata.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(path).ok()?.filter_map(|entry| entry.ok()).collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let child = entry.file_name().into_string().ok()?;
+            collect(&entry.path(), &format!("{name}/{child}"), files, total)?;
+        }
     }
-    Ok(())
+    Some(())
+}
+
+/// The local path of a `file://` URI, percent-decoded.
+fn local_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
 }
 
 /// One request/response exchange with the Mac over TCP, authenticated like the datagrams.
@@ -128,5 +264,30 @@ mod tests {
         assert_eq!(utf8_text("STRING", vec![0x68, 0xe9]), "hé".as_bytes());
         assert_eq!(utf8_text("UTF8_STRING", "hé".as_bytes().to_vec()), "hé".as_bytes());
         assert_eq!(utf8_text("TEXT", vec![0x68, 0xff]), "h\u{fffd}".as_bytes());
+    }
+
+    #[test]
+    fn file_uris_decode_to_local_paths() {
+        assert_eq!(local_path("file:///home/m/My%20File.txt"), Some(PathBuf::from("/home/m/My File.txt")));
+        assert_eq!(local_path("file://localhost/tmp/a"), Some(PathBuf::from("/tmp/a")));
+        assert_eq!(local_path("https://example.com/a"), None);
+        assert_eq!(local_path("file://otherhost/a"), None);
+        assert_eq!(local_path("file:///bad%zz"), None);
+    }
+
+    #[test]
+    fn copied_folders_are_bundled_recursively() {
+        let root = std::env::temp_dir().join(format!("ferry-bundle-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Folder/sub")).unwrap();
+        std::fs::write(root.join("Folder/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("Folder/sub/b.txt"), b"bb").unwrap();
+        std::fs::write(root.join("single.txt"), b"s").unwrap();
+        let list = format!("file://{}\r\nfile://{}\r\n", root.join("Folder").display(), root.join("single.txt").display());
+        let bundle = files_from_uri_list(&list).unwrap();
+        let files = clip::decode_files(&bundle).unwrap();
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["Folder/a.txt", "Folder/sub/b.txt", "single.txt"]);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(files_from_uri_list("https://example.com/x\n"), None);
     }
 }

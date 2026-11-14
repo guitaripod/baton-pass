@@ -169,6 +169,7 @@ mod tests {
     fn session_messages_need_token_address_and_a_rising_counter() {
         let mut doorman = Doorman::new();
         let token = joined(&mut doorman, addr(1));
+        assert_eq!((doorman.token(), doorman.peer()), (Some(token), Some(addr(1))));
         let heartbeat = || Msg::Heartbeat { entered: false, keys: Default::default(), buttons: 0 };
         assert!(matches!(doorman.admit(envelope(token, 5, heartbeat()), addr(1)), Admission::Accept { .. }));
         assert_eq!(doorman.admit(envelope(token, 5, heartbeat()), addr(1)), Admission::Ignore);

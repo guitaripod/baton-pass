@@ -11,6 +11,7 @@ const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 pub const OVERHEAD: usize = HEADER.len() + NONCE_LEN + TAG_LEN;
 
+#[derive(Clone)]
 pub struct Cipher(XChaCha20Poly1305);
 
 impl Cipher {
