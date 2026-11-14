@@ -4,9 +4,7 @@ use crate::proto::{Envelope, MAX_CLIPBOARD};
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::Read;
 use std::net::SocketAddr;
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -45,7 +43,10 @@ impl Clipboard {
     /// Offers `clip` on the clipboard in every format it carries, served from a thread until
     /// something else is copied.
     pub async fn write(&self, clip: &Clip) -> Result<()> {
-        let sources = sources(clip);
+        let sources = match clip::get(clip, FILES) {
+            Some(bundle) => file_sources(bundle)?,
+            None => sources(clip),
+        };
         if sources.is_empty() {
             return Ok(());
         }
@@ -162,69 +163,31 @@ fn files_from_uri_list(list: &str) -> Option<Vec<u8>> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(local_path)
+        .map(clip::local_path)
         .collect::<Option<_>>()?;
     if paths.is_empty() {
         return None;
     }
-    let mut files = Vec::new();
-    let mut total = 0usize;
-    for path in &paths {
-        let name = path.file_name()?.to_str()?.to_string();
-        collect(path, &name, &mut files, &mut total)?;
-    }
-    if files.is_empty() {
-        return None;
-    }
-    let bundle = clip::encode_files(&files);
-    (bundle.len() <= MAX_CLIPBOARD).then_some(bundle)
+    clip::bundle_paths(&paths)
 }
 
-/// Adds `path` (a file, or a folder walked recursively) under the bundle name `name`.
-/// Symbolic links and special files are left out.
-fn collect(path: &Path, name: &str, files: &mut Vec<clip::File>, total: &mut usize) -> Option<()> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if metadata.is_file() {
-        *total += metadata.len() as usize;
-        if *total > MAX_CLIPBOARD {
-            tracing::info!("copied files are over {} MB; only their names go to the Mac", MAX_CLIPBOARD >> 20);
-            return None;
-        }
-        let data = std::fs::read(path).ok()?;
-        let executable = metadata.permissions().mode() & 0o111 != 0;
-        files.push(clip::File { path: name.to_string(), executable, data });
-    } else if metadata.is_dir() {
-        let mut entries: Vec<_> = std::fs::read_dir(path).ok()?.filter_map(|entry| entry.ok()).collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let child = entry.file_name().into_string().ok()?;
-            collect(&entry.path(), &format!("{name}/{child}"), files, total)?;
-        }
-    }
-    Some(())
-}
-
-/// The local path of a `file://` URI, percent-decoded.
-fn local_path(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    if !rest.starts_with('/') {
-        return None;
-    }
-    let bytes = rest.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
-            decoded.push(u8::from_str_radix(hex, 16).ok()?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+/// Unpacks files from the Mac under ~/.cache/ferry/clipboard and offers them the way file
+/// managers copy files, so pasting in Dolphin copies them.
+fn file_sources(bundle: &[u8]) -> Result<Vec<copy::MimeSource>> {
+    let files = clip::decode_files(bundle).context("malformed file bundle")?;
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .context("no cache folder")?;
+    let items = clip::unpack(&files, &cache.join("ferry/clipboard"))?;
+    let uris: Vec<String> = items.iter().map(|item| clip::file_uri(item)).collect();
+    let paths: Vec<String> = items.iter().map(|item| item.display().to_string()).collect();
+    let bytes = |text: String| copy::Source::Bytes(text.into_bytes().into_boxed_slice());
+    Ok(vec![
+        copy::MimeSource { source: bytes(uris.iter().map(|uri| format!("{uri}\r\n")).collect()), mime_type: copy::MimeType::Specific("text/uri-list".into()) },
+        copy::MimeSource { source: bytes(format!("copy\n{}", uris.join("\n"))), mime_type: copy::MimeType::Specific("x-special/gnome-copied-files".into()) },
+        copy::MimeSource { source: bytes(paths.join("\n")), mime_type: copy::MimeType::Text },
+    ])
 }
 
 /// One request/response exchange with the Mac over TCP, authenticated like the datagrams.
@@ -267,27 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn file_uris_decode_to_local_paths() {
-        assert_eq!(local_path("file:///home/m/My%20File.txt"), Some(PathBuf::from("/home/m/My File.txt")));
-        assert_eq!(local_path("file://localhost/tmp/a"), Some(PathBuf::from("/tmp/a")));
-        assert_eq!(local_path("https://example.com/a"), None);
-        assert_eq!(local_path("file://otherhost/a"), None);
-        assert_eq!(local_path("file:///bad%zz"), None);
-    }
-
-    #[test]
-    fn copied_folders_are_bundled_recursively() {
-        let root = std::env::temp_dir().join(format!("ferry-bundle-test-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("Folder/sub")).unwrap();
-        std::fs::write(root.join("Folder/a.txt"), b"a").unwrap();
-        std::fs::write(root.join("Folder/sub/b.txt"), b"bb").unwrap();
-        std::fs::write(root.join("single.txt"), b"s").unwrap();
-        let list = format!("file://{}\r\nfile://{}\r\n", root.join("Folder").display(), root.join("single.txt").display());
-        let bundle = files_from_uri_list(&list).unwrap();
-        let files = clip::decode_files(&bundle).unwrap();
-        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
-        assert_eq!(paths, ["Folder/a.txt", "Folder/sub/b.txt", "single.txt"]);
-        std::fs::remove_dir_all(&root).unwrap();
+    fn non_file_uris_travel_as_text() {
         assert_eq!(files_from_uri_list("https://example.com/x\n"), None);
     }
 }

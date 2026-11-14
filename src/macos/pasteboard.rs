@@ -3,12 +3,12 @@ use crate::proto::MAX_CLIPBOARD;
 use anyhow::{Context, Result, bail};
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
-    NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypePNG,
-    NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardTypeTIFF, NSPasteboardWriting,
+    NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypeHTML,
+    NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardTypeTIFF, NSPasteboardWriting,
 };
-use objc2_foundation::{NSArray, NSData, NSDictionary, NSString, NSURL};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSString};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -28,16 +28,25 @@ pub fn helper_get() -> Result<()> {
     Ok(())
 }
 
-/// The pasteboard as a clip: an image (PNG, or TIFF converted to PNG), or HTML and RTF, each
-/// with the plain text alongside when the copying app offered it.
+/// The pasteboard as a clip: files copied in Finder as a bundle, an image (PNG, or TIFF
+/// converted to PNG), or HTML and RTF, each with the plain text alongside when the copying app
+/// offered it.
 unsafe fn read_pasteboard(pasteboard: &NSPasteboard) -> Option<Clip> {
     let types = pasteboard.types()?;
-    let (png, tiff, html, rtf, text) = unsafe {
-        (NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSPasteboardTypeHTML, NSPasteboardTypeRTF, NSPasteboardTypeString)
+    let (png, tiff, html, rtf, text, file) = unsafe {
+        (NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSPasteboardTypeHTML, NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardTypeFileURL)
     };
     let has = |wanted: &NSString| types.iter().any(|offered| &*offered == wanted);
     let mut content: Clip = Vec::new();
-    if has(png) {
+    if has(file) {
+        let paths: Vec<PathBuf> = pasteboard
+            .pasteboardItems()
+            .map(|items| items.iter().filter_map(|item| item.stringForType(file)).filter_map(|uri| clip::local_path(&uri.to_string())).collect())
+            .unwrap_or_default();
+        if let Some(bundle) = clip::bundle_paths(&paths) {
+            content.push((FILES.to_string(), bundle));
+        }
+    } else if has(png) {
         content.extend(pasteboard.dataForType(png).map(|data| (PNG.to_string(), data.to_vec())));
     } else if has(tiff) {
         let data = pasteboard.dataForType(tiff)?;
@@ -71,13 +80,18 @@ pub fn helper_set() -> Result<()> {
     let pasteboard = NSPasteboard::generalPasteboard();
     if let Some(bundle) = clip::get(&content, FILES) {
         let files = clip::decode_files(bundle).context("malformed file bundle")?;
-        let items = unpack(&files)?;
-        let urls: Vec<_> = items
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        let items = clip::unpack(&files, &Path::new(&home).join("Library/Caches/dev.ferry.Ferry/Clipboard"))?;
+        let entries: Vec<_> = items
             .iter()
-            .map(|path| ProtocolObject::<dyn NSPasteboardWriting>::from_retained(NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))))
+            .map(|path| {
+                let entry = NSPasteboardItem::new();
+                unsafe { entry.setString_forType(&NSString::from_str(&clip::file_uri(path)), NSPasteboardTypeFileURL) };
+                ProtocolObject::<dyn NSPasteboardWriting>::from_retained(entry)
+            })
             .collect();
         pasteboard.clearContents();
-        if !pasteboard.writeObjects(&NSArray::from_retained_slice(&urls)) {
+        if !pasteboard.writeObjects(&NSArray::from_retained_slice(&entries)) {
             bail!("the pasteboard refused the copied files");
         }
     } else {
@@ -86,8 +100,20 @@ pub fn helper_set() -> Result<()> {
             unsafe { put(&pasteboard, mime, data)? };
         }
     }
+    settle_pasteboard();
     std::io::stdout().write_all(&(pasteboard.changeCount() as i64).to_le_bytes())?;
     Ok(())
+}
+
+/// Runs this process's run loop briefly so the pasteboard server receives everything written.
+/// Writes reach it asynchronously, and a helper that exits straight after writing loses some of
+/// them: with two copied files, only the first used to arrive.
+fn settle_pasteboard() {
+    unsafe extern "C" {
+        static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+        fn CFRunLoopRunInMode(mode: *const std::ffi::c_void, seconds: f64, return_after_source_handled: u8) -> i32;
+    }
+    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.2, 0) };
 }
 
 unsafe fn put(pasteboard: &NSPasteboard, mime: &str, data: &[u8]) -> Result<()> {
@@ -115,31 +141,6 @@ unsafe fn put(pasteboard: &NSPasteboard, mime: &str, data: &[u8]) -> Result<()> 
     Ok(())
 }
 
-/// Writes the bundled files into a fresh folder under ~/Library/Caches/dev.ferry.Ferry (the
-/// previous one is removed) and returns the top-level items, as the desktop had them selected.
-fn unpack(files: &[clip::File]) -> Result<Vec<PathBuf>> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let parent = Path::new(&home).join("Library/Caches/dev.ferry.Ferry/Clipboard");
-    if parent.exists() {
-        std::fs::remove_dir_all(&parent).with_context(|| format!("clearing {}", parent.display()))?;
-    }
-    let mut items: Vec<PathBuf> = Vec::new();
-    for file in files {
-        let target = parent.join(&file.path);
-        if let Some(folder) = target.parent() {
-            std::fs::create_dir_all(folder)?;
-        }
-        std::fs::write(&target, &file.data).with_context(|| format!("writing {}", target.display()))?;
-        if file.executable {
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
-        }
-        let top = parent.join(file.path.split('/').next().unwrap_or(&file.path));
-        if !items.contains(&top) {
-            items.push(top);
-        }
-    }
-    Ok(items)
-}
 
 /// The user sitting at the Mac, if anyone is logged in at the console.
 fn console_user() -> Option<(u32, String)> {
