@@ -6,7 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const HEADER: [u8; 3] = *b"FY\x01";
+const HEADER: [u8; 3] = *b"BP\x01";
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 pub const OVERHEAD: usize = HEADER.len() + NONCE_LEN + TAG_LEN;
@@ -17,7 +17,7 @@ pub struct Cipher(XChaCha20Poly1305);
 impl Cipher {
     pub fn load(path: &Path) -> Result<Self> {
         let metadata = std::fs::metadata(path)
-            .with_context(|| format!("reading key {} (run `ferry keygen`)", path.display()))?;
+            .with_context(|| format!("reading key {} (run `baton-pass keygen`)", path.display()))?;
         if metadata.permissions().mode() & 0o077 != 0 {
             bail!("{} must not be readable by group or others (chmod 600)", path.display());
         }

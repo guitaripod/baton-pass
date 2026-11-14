@@ -162,7 +162,7 @@ pub async fn run(config: Config) -> Result<()> {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut buffer = vec![0u8; 2048];
 
-    tracing::info!("ferry {} running; hotkey {}", env!("CARGO_PKG_VERSION"), daemon.hotkey.qt_name());
+    tracing::info!("baton-pass {} running; hotkey {}", env!("CARGO_PKG_VERSION"), daemon.hotkey.qt_name());
     loop {
         tokio::select! {
             received = daemon.link.recv(&mut buffer) => match received {
@@ -465,7 +465,7 @@ impl Daemon {
         }
     }
 
-    /// Input arriving with no capture of ours means the compositor holds one that ferry is not
+    /// Input arriving with no capture of ours means the compositor holds one that Baton Pass is not
     /// tracking, which leaves the desktop cursor hidden and dead. A short burst is normal: the
     /// first events of a new capture can beat its Activated signal, and the last of an ended
     /// one can trail its release. Only input that keeps coming for `STRAY_PERSIST` is acted on.
@@ -578,7 +578,7 @@ impl Daemon {
             return;
         }
         if !self.link.connected() {
-            self.notify("The Mac is not reachable", "ferry keeps looking for it");
+            self.notify("The Mac is not reachable", "Baton Pass keeps looking for it");
             return;
         }
         self.arm().await;
@@ -649,7 +649,7 @@ impl Daemon {
         let gap = self.link.observe(Instant::now(), TICK * 2);
         if gap > LATE_TICK {
             tracing::warn!("event loop stalled: {} ms between ticks", gap.as_millis());
-            self.note_hiccup(format!("ferry stalled for {} ms", gap.as_millis()));
+            self.note_hiccup(format!("Baton Pass stalled for {} ms", gap.as_millis()));
             if self.capture.is_some() && self.link.connected() {
                 self.heartbeat().await;
             }
@@ -730,7 +730,7 @@ impl Daemon {
     fn look(&self) -> tray::Look {
         let connected = self.link.connected();
         let (icon, status, headline) = match (connected, self.capture.is_some()) {
-            (false, _) => ("network-disconnect", "NeedsAttention", "Ferry is looking for the Mac"),
+            (false, _) => ("network-disconnect", "NeedsAttention", "Baton Pass is looking for the Mac"),
             (true, true) => ("computer-laptop", "Active", "Mouse and keyboard are on the Mac"),
             (true, false) => ("input-mouse", "Passive", "Mouse and keyboard are here"),
         };
@@ -744,7 +744,7 @@ impl Daemon {
         let recent = self.hiccups.iter().filter(|(at, _)| at.elapsed() < hour).count();
         match self.hiccups.back() {
             Some((at, what)) => details.push(format!("Last hiccup {}: {what} ({recent} in the last hour)", ago(*at))),
-            None => details.push("No hiccups since ferry started".into()),
+            None => details.push("No hiccups since Baton Pass started".into()),
         }
         tray::Look { icon, status, headline: headline.into(), details: details.join("\n") }
     }

@@ -32,7 +32,7 @@ void set_flag(uint32_t bit, bool on) {
 
 } // namespace
 
-extern "C" void ferry_vhid_start(uint16_t vendor_id, uint16_t product_id, uint8_t country_code) {
+extern "C" void batonpass_vhid_start(uint16_t vendor_id, uint16_t product_id, uint8_t country_code) {
   if (client) {
     return;
   }
@@ -72,11 +72,11 @@ extern "C" void ferry_vhid_start(uint16_t vendor_id, uint16_t product_id, uint8_
   client->async_start();
 }
 
-extern "C" uint32_t ferry_vhid_flags(void) {
+extern "C" uint32_t batonpass_vhid_flags(void) {
   return flags.load();
 }
 
-extern "C" void ferry_vhid_keyboard(uint8_t modifiers, const uint16_t* keys, size_t count) {
+extern "C" void batonpass_vhid_keyboard(uint8_t modifiers, const uint16_t* keys, size_t count) {
   if (!client) {
     return;
   }
@@ -92,7 +92,7 @@ extern "C" void ferry_vhid_keyboard(uint8_t modifiers, const uint16_t* keys, siz
   client->async_post_report(report);
 }
 
-extern "C" void ferry_vhid_consumer(const uint16_t* keys, size_t count) {
+extern "C" void batonpass_vhid_consumer(const uint16_t* keys, size_t count) {
   if (!client) {
     return;
   }
@@ -103,7 +103,7 @@ extern "C" void ferry_vhid_consumer(const uint16_t* keys, size_t count) {
   client->async_post_report(report);
 }
 
-extern "C" void ferry_vhid_pointing(uint32_t buttons, int8_t x, int8_t y, int8_t vertical_wheel, int8_t horizontal_wheel) {
+extern "C" void batonpass_vhid_pointing(uint32_t buttons, int8_t x, int8_t y, int8_t vertical_wheel, int8_t horizontal_wheel) {
   if (!client) {
     return;
   }

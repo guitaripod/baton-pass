@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 pub type Signals<T> = Pin<Box<dyn Stream<Item = T>>>;
 
-/// How long the Disabled signal echoing one of ferry's own barrier changes may take to arrive.
+/// How long the Disabled signal echoing one of Baton Pass's own barrier changes may take to arrive.
 const DISABLE_ECHO: Duration = Duration::from_secs(2);
 
 pub struct PortalSignals {
@@ -33,7 +33,7 @@ pub struct Ei {
 }
 
 impl Ei {
-    /// Binds every seat to the capabilities ferry forwards; everything else stays with the compositor.
+    /// Binds every seat to the capabilities Baton Pass forwards; everything else stays with the compositor.
     pub fn bind_seat(&self, event: &EiEvent) {
         if let EiEvent::SeatAdded(added) = event {
             added.seat.bind_capabilities(
@@ -115,7 +115,7 @@ impl Portal {
         stream.set_nonblocking(true)?;
         let context = ei::Context::new(stream)?;
         let (_connection, events) = context
-            .handshake_tokio("ferry", ei::handshake::ContextType::Receiver)
+            .handshake_tokio("baton-pass", ei::handshake::ContextType::Receiver)
             .await
             .map_err(|error| anyhow!("ei handshake: {error:?}"))?;
         let portal = Self { capture, session, edges: Vec::new(), enabled: false, expected_disables: Vec::new() };
@@ -162,8 +162,8 @@ impl Portal {
         }
     }
 
-    /// Disarms even when ferry believes the session is already disabled, for when the
-    /// compositor keeps delivering input that ferry never asked for.
+    /// Disarms even when Baton Pass believes the session is already disabled, for when the
+    /// compositor keeps delivering input that Baton Pass never asked for.
     pub async fn force_disarm(&mut self) {
         self.enabled = true;
         self.clear_barriers().await;
@@ -198,7 +198,7 @@ impl Portal {
         Ok(response)
     }
 
-    /// Sorts a Disabled signal: true when it echoes ferry's own barrier change, false when the
+    /// Sorts a Disabled signal: true when it echoes Baton Pass's own barrier change, false when the
     /// compositor disabled capture by itself (the session is then marked disabled).
     pub fn own_disable(&mut self) -> bool {
         let now = Instant::now();
@@ -317,7 +317,7 @@ fn state_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("ferry")
+        .join("baton-pass")
 }
 
 fn load_restore_token() -> Option<String> {

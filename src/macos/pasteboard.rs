@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 /// Reads the general pasteboard as the console user and writes its change count and every
-/// format ferry carries to stdout. Runs inside the user's session via `ferry clip-get`.
+/// format Baton Pass carries to stdout. Runs inside the user's session via `baton-pass clip-get`.
 pub fn helper_get() -> Result<()> {
     let pasteboard = NSPasteboard::generalPasteboard();
     let change = pasteboard.changeCount() as i64;
@@ -72,7 +72,7 @@ unsafe fn read_pasteboard(pasteboard: &NSPasteboard) -> Option<Clip> {
 /// Replaces the general pasteboard with the clip on stdin and writes the pasteboard's new
 /// change count to stdout. Files are unpacked into a folder in the user's caches first, and
 /// the pasteboard gets their URLs, so pasting in Finder copies them. Runs inside the user's
-/// session via `ferry clip-set`.
+/// session via `baton-pass clip-set`.
 pub fn helper_set() -> Result<()> {
     let mut bytes = Vec::new();
     std::io::stdin().take(MAX_CLIPBOARD as u64 + 4096).read_to_end(&mut bytes)?;
@@ -81,7 +81,7 @@ pub fn helper_set() -> Result<()> {
     if let Some(bundle) = clip::get(&content, FILES) {
         let files = clip::decode_files(bundle).context("malformed file bundle")?;
         let home = std::env::var_os("HOME").context("HOME is not set")?;
-        let items = clip::unpack(&files, &Path::new(&home).join("Library/Caches/dev.ferry.Ferry/Clipboard"))?;
+        let items = clip::unpack(&files, &Path::new(&home).join("Library/Caches/dev.batonpass.BatonPass/Clipboard"))?;
         let entries: Vec<_> = items
             .iter()
             .map(|path| {

@@ -104,7 +104,7 @@ impl Config {
     pub fn dir() -> PathBuf {
         #[cfg(target_os = "macos")]
         {
-            PathBuf::from("/usr/local/etc/ferry")
+            PathBuf::from("/usr/local/etc/baton-pass")
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -112,7 +112,7 @@ impl Config {
                 .map(PathBuf::from)
                 .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join("ferry")
+                .join("baton-pass")
         }
     }
 

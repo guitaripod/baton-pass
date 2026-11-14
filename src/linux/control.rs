@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
-pub const BUS_NAME: &str = "dev.ferry.Ferry";
-pub const OBJECT_PATH: &str = "/dev/ferry/Ferry";
+pub const BUS_NAME: &str = "dev.batonpass.BatonPass";
+pub const OBJECT_PATH: &str = "/dev/batonpass/BatonPass";
 
 pub enum Request {
     Toggle(Option<(f64, f64)>),
@@ -12,9 +12,9 @@ pub enum Request {
 
 struct Service(mpsc::UnboundedSender<Request>);
 
-#[zbus::interface(name = "dev.ferry.Ferry")]
+#[zbus::interface(name = "dev.batonpass.BatonPass")]
 impl Service {
-    /// Called by the KWin script with the cursor position as strings, or by `ferry toggle` with empty ones.
+    /// Called by the KWin script with the cursor position as strings, or by `baton-pass toggle` with empty ones.
     async fn toggle(&self, x: String, y: String) {
         let position = x.trim().parse::<f64>().ok().zip(y.trim().parse::<f64>().ok());
         let _ = self.0.send(Request::Toggle(position));
@@ -23,7 +23,7 @@ impl Service {
     async fn status(&self) -> String {
         let (reply, answer) = oneshot::channel();
         if self.0.send(Request::Status(reply)).is_err() {
-            return "ferry is shutting down".into();
+            return "baton-pass is shutting down".into();
         }
         answer.await.unwrap_or_else(|_| "no answer".into())
     }
@@ -35,7 +35,7 @@ pub async fn serve(requests: mpsc::UnboundedSender<Request>) -> Result<zbus::Con
         .serve_at(OBJECT_PATH, Service(requests))
         .build()
         .await
-        .context("claiming dev.ferry.Ferry on the session bus (is another ferry running?)")
+        .context("claiming dev.batonpass.BatonPass on the session bus (is another baton-pass running?)")
 }
 
 pub async fn notify(connection: &zbus::Connection, summary: &str, body: &str) {
@@ -46,7 +46,7 @@ pub async fn notify(connection: &zbus::Connection, summary: &str, body: &str) {
             "/org/freedesktop/Notifications",
             Some("org.freedesktop.Notifications"),
             "Notify",
-            &("Ferry", 0u32, "input-mouse", summary, body, Vec::<&str>::new(), hints, 4000i32),
+            &("Baton Pass", 0u32, "input-mouse", summary, body, Vec::<&str>::new(), hints, 4000i32),
         )
         .await;
     if let Err(error) = result {
@@ -59,7 +59,7 @@ async fn call(method: &str, body: &(&str, &str)) -> Result<zbus::message::Messag
     connection
         .call_method(Some(BUS_NAME), OBJECT_PATH, Some(BUS_NAME), method, body)
         .await
-        .context("ferry is not running (systemctl --user status ferry)")
+        .context("baton-pass is not running (systemctl --user status baton-pass)")
 }
 
 async fn call_unit(method: &str) -> Result<zbus::message::Message> {
@@ -67,7 +67,7 @@ async fn call_unit(method: &str) -> Result<zbus::message::Message> {
     connection
         .call_method(Some(BUS_NAME), OBJECT_PATH, Some(BUS_NAME), method, &())
         .await
-        .context("ferry is not running (systemctl --user status ferry)")
+        .context("baton-pass is not running (systemctl --user status baton-pass)")
 }
 
 pub async fn toggle() -> Result<()> {

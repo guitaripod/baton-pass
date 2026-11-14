@@ -32,12 +32,12 @@ impl Item {
 
     #[zbus(property)]
     fn id(&self) -> &str {
-        "ferry"
+        "baton-pass"
     }
 
     #[zbus(property)]
     fn title(&self) -> &str {
-        "Ferry"
+        "Baton Pass"
     }
 
     #[zbus(property)]
@@ -86,7 +86,7 @@ impl Item {
     async fn new_status(emitter: &SignalEmitter<'_>, status: &str) -> zbus::Result<()>;
 }
 
-/// ferry's icon in the panel's system tray, served on the daemon's own bus connection.
+/// Baton Pass's icon in the panel's system tray, served on the daemon's own bus connection.
 pub struct Tray {
     connection: zbus::Connection,
     shown: Option<Look>,

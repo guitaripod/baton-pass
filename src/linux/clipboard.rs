@@ -26,13 +26,13 @@ impl Clipboard {
         Self { serving: Arc::new(AtomicBool::new(false)) }
     }
 
-    /// True while the clipboard still holds what ferry last put there, so there is nothing new
+    /// True while the clipboard still holds what Baton Pass last put there, so there is nothing new
     /// to carry over.
     pub fn holds_ours(&self) -> bool {
         self.serving.load(Ordering::Acquire)
     }
 
-    /// Reads every format ferry carries from the clipboard; files come along as a bundle.
+    /// Reads every format Baton Pass carries from the clipboard; files come along as a bundle.
     pub async fn read(&self) -> Result<Option<Clip>> {
         tokio::time::timeout(TIMEOUT, tokio::task::spawn_blocking(read_blocking))
             .await
@@ -52,7 +52,7 @@ impl Clipboard {
         }
         let (ready, prepared) = tokio::sync::oneshot::channel();
         let serving = self.serving.clone();
-        std::thread::Builder::new().name("ferry-clipboard".into()).spawn(move || {
+        std::thread::Builder::new().name("baton-pass-clipboard".into()).spawn(move || {
             let mut options = copy::Options::new();
             options.foreground(true);
             match options.prepare_copy_multi(sources) {
@@ -171,7 +171,7 @@ fn files_from_uri_list(list: &str) -> Option<Vec<u8>> {
     clip::bundle_paths(&paths)
 }
 
-/// Unpacks files from the Mac under ~/.cache/ferry/clipboard and offers them the way file
+/// Unpacks files from the Mac under ~/.cache/baton-pass/clipboard and offers them the way file
 /// managers copy files, so pasting in Dolphin copies them.
 fn file_sources(bundle: &[u8]) -> Result<Vec<copy::MimeSource>> {
     let files = clip::decode_files(bundle).context("malformed file bundle")?;
@@ -179,7 +179,7 @@ fn file_sources(bundle: &[u8]) -> Result<Vec<copy::MimeSource>> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .context("no cache folder")?;
-    let items = clip::unpack(&files, &cache.join("ferry/clipboard"))?;
+    let items = clip::unpack(&files, &cache.join("baton-pass/clipboard"))?;
     let uris: Vec<String> = items.iter().map(|item| clip::file_uri(item)).collect();
     let paths: Vec<String> = items.iter().map(|item| item.display().to_string()).collect();
     let bytes = |text: String| copy::Source::Bytes(text.into_bytes().into_boxed_slice());

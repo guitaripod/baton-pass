@@ -14,7 +14,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ferry", version, about = "Carry this desktop's mouse and keyboard over to a Mac")]
+#[command(name = "baton-pass", version, about = "Carry this desktop's mouse and keyboard over to a Mac")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -26,17 +26,17 @@ enum Command {
     Run,
     /// Create the shared key if it does not exist yet and print its path
     Keygen,
-    /// Put a fresh shared key on both machines: run `sudo ferry pair` on the Mac first, then
-    /// `ferry pair <code>` here with the code it shows
+    /// Put a fresh shared key on both machines: run `sudo baton-pass pair` on the Mac first, then
+    /// `baton-pass pair <code>` here with the code it shows
     #[cfg(target_os = "linux")]
     Pair {
-        /// The eight-digit code `sudo ferry pair` shows on the Mac
+        /// The eight-digit code `sudo baton-pass pair` shows on the Mac
         code: String,
         /// The Mac's address, if not the first configured peer
         #[arg(long)]
         peer: Option<String>,
     },
-    /// Show a pairing code and wait for the desktop to run `ferry pair <code>`
+    /// Show a pairing code and wait for the desktop to run `baton-pass pair <code>`
     #[cfg(target_os = "macos")]
     Pair,
     /// Switch the mouse and keyboard to the Mac, or back

@@ -1,4 +1,4 @@
-//! The clipboard as ferry carries it between the machines: every format the copying app
+//! The clipboard as Baton Pass carries it between the machines: every format the copying app
 //! offered that the other side understands, plus copied files as one bundle.
 
 use crate::proto::MAX_CLIPBOARD;
@@ -12,7 +12,7 @@ pub const TEXT: &str = "text/plain;charset=utf-8";
 pub const HTML: &str = "text/html";
 pub const RTF: &str = "text/rtf";
 pub const PNG: &str = "image/png";
-pub const FILES: &str = "application/x-ferry-files";
+pub const FILES: &str = "application/x-baton-pass-files";
 const MAX_FLAVORS: usize = 8;
 const MAX_FILES: usize = 10_000;
 
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn copied_folders_bundle_and_unpack() {
-        let root = std::env::temp_dir().join(format!("ferry-bundle-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("baton-pass-bundle-test-{}", std::process::id()));
         std::fs::create_dir_all(root.join("Folder/sub")).unwrap();
         std::fs::write(root.join("Folder/a.txt"), b"a").unwrap();
         std::fs::write(root.join("Folder/sub/b.sh"), b"bb").unwrap();

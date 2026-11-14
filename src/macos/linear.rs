@@ -7,7 +7,7 @@ const ACCELERATION_OFF: &str = r#"{"HIDMouseAcceleration":-65536}"#;
 /// Turns macOS pointer acceleration off for Karabiner's virtual pointer, so one count moves the
 /// cursor a fixed distance and the desktop's own (already accelerated) motion carries over 1:1.
 /// LinearMouse re-applies its own settings whenever the active pointing device changes, so when
-/// it runs it is left in charge (install-mac.sh gives it a profile for this device) and ferry
+/// it runs it is left in charge (install-mac.sh gives it a profile for this device) and Baton Pass
 /// only steps in on Macs without it.
 pub async fn ensure_linear_pointer() {
     if running("LinearMouse").await {

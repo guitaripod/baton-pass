@@ -93,7 +93,7 @@ impl Watcher {
     pub fn start(interval: std::time::Duration) -> Self {
         let latest = std::sync::Arc::new(std::sync::Mutex::new(online()));
         let shared = latest.clone();
-        let spawned = std::thread::Builder::new().name("ferry-displays".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("baton-pass-displays".into()).spawn(move || {
             loop {
                 std::thread::sleep(interval);
                 let displays = online();

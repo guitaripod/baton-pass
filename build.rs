@@ -16,7 +16,7 @@ fn main() {
         .flag("-std=c++23")
         .flag("-Wno-deprecated-declarations")
         .opt_level(2)
-        .compile("ferry_vhid");
+        .compile("batonpass_vhid");
     println!("cargo:rustc-link-lib=c++");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rustc-link-lib=framework=IOKit");

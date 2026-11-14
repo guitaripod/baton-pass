@@ -9,7 +9,7 @@ pub struct Slammer(VirtualDevice);
 impl Slammer {
     pub fn new() -> std::io::Result<Self> {
         let device = VirtualDevice::builder()?
-            .name("ferry hotkey pointer")
+            .name("baton-pass hotkey pointer")
             .with_relative_axes(&AttributeSet::from_iter([RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y]))?
             .with_keys(&AttributeSet::from_iter([KeyCode::BTN_LEFT]))?
             .build()?;

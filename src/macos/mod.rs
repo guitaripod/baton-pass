@@ -141,7 +141,7 @@ pub async fn run(config: Config) -> Result<()> {
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut buffer = vec![0u8; 2048];
-    tracing::info!("ferry {} listening on {}", env!("CARGO_PKG_VERSION"), config.listen);
+    tracing::info!("baton-pass {} listening on {}", env!("CARGO_PKG_VERSION"), config.listen);
     let mut next_tick = tokio::time::Instant::now();
     loop {
         let poll = receiver.poll_interval();
@@ -346,9 +346,9 @@ impl Receiver {
         post_motion(buttons, &mut x, &mut y, &mut vertical, &mut horizontal);
     }
 
-    /// Watches for the count-to-point ratio changing under ferry (LinearMouse applying its
+    /// Watches for the count-to-point ratio changing under Baton Pass (LinearMouse applying its
     /// profile, a new tracking speed) by comparing, over each tenth of a second, how far the
-    /// cursor went with how many counts were posted. Windows that overlap ferry's own corrective
+    /// cursor went with how many counts were posted. Windows that overlap Baton Pass's own corrective
     /// nudges are skipped, and the ratio only moves on a sustained shift (see `shifted_ratio`),
     /// so the pointer speed never wobbles with measurement noise.
     fn learn_ratio(&mut self, cursor: Point) {

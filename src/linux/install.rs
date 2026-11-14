@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-pub const APP_ID: &str = "dev.ferry.Ferry";
-const SCRIPT_ID: &str = "ferry";
+pub const APP_ID: &str = "dev.batonpass.BatonPass";
+const SCRIPT_ID: &str = "batonpass";
 
 pub async fn install(peers: Vec<String>) -> Result<()> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
@@ -15,7 +15,7 @@ pub async fn install(peers: Vec<String>) -> Result<()> {
     let config_path = Config::path();
     if !config_path.exists() {
         if peers.is_empty() {
-            bail!("first install needs the Mac's address: ferry install --peer <lan-ip> [--peer <tailnet-name>]");
+            bail!("first install needs the Mac's address: baton-pass install --peer <lan-ip> [--peer <tailnet-name>]");
         }
         write(&config_path, &default_config(&peers))?;
         println!("wrote {}", config_path.display());
@@ -38,13 +38,13 @@ pub async fn install(peers: Vec<String>) -> Result<()> {
     load_kwin_script(&main_script).await?;
     claim_shortcut(&hotkey).await?;
 
-    let unit = home.join(".config/systemd/user/ferry.service");
+    let unit = home.join(".config/systemd/user/baton-pass.service");
     write(&unit, &systemd_unit(&executable))?;
     run("systemctl", &["--user", "daemon-reload"]).await?;
-    run("systemctl", &["--user", "enable", "ferry.service"]).await?;
-    run("systemctl", &["--user", "restart", "ferry.service"]).await?;
+    run("systemctl", &["--user", "enable", "baton-pass.service"]).await?;
+    run("systemctl", &["--user", "restart", "baton-pass.service"]).await?;
 
-    println!("installed: ferry.service running, hotkey {} registered with KWin", hotkey.qt_name());
+    println!("installed: baton-pass.service running, hotkey {} registered with KWin", hotkey.qt_name());
     println!("key: {}", Config::key_path().display());
     Ok(())
 }
@@ -86,7 +86,7 @@ async fn load_kwin_script(main_script: &Path) -> Result<()> {
         .body()
         .deserialize()?;
     if !loaded {
-        bail!("KWin did not load the ferry script");
+        bail!("KWin did not load the baton-pass script");
     }
     Ok(())
 }
@@ -117,7 +117,7 @@ fn with_peers(config: &str, peers: &[String]) -> String {
     lines.join("\n") + "\n"
 }
 
-/// Makes the hotkey ferry's alone: kglobalaccel hands a key to the first action that has it,
+/// Makes the hotkey Baton Pass's alone: kglobalaccel hands a key to the first action that has it,
 /// and Plasma ships Meta+Esc as System Monitor's launcher, so other owners are unbound.
 async fn claim_shortcut(hotkey: &Hotkey) -> Result<()> {
     let Some(combination) = hotkey.qt_combination() else { return Ok(()) };
@@ -128,7 +128,7 @@ async fn claim_shortcut(hotkey: &Hotkey) -> Result<()> {
     let owners: Vec<Owner> =
         connection.call_method(destination, path, interface, method, &(combination,)).await?.body().deserialize()?;
     for (unique, friendly, component, component_friendly, ..) in owners {
-        if component == "kwin" && unique == "FerryToggle" {
+        if component == "kwin" && unique == "BatonPassToggle" {
             continue;
         }
         let (destination, path, interface, method) = call("setShortcutKeys");
@@ -140,7 +140,7 @@ async fn claim_shortcut(hotkey: &Hotkey) -> Result<()> {
         println!("took {} from \"{friendly}\" ({component})", hotkey.qt_name());
     }
     let (destination, path, interface, method) = call("setShortcutKeys");
-    let ours = vec!["kwin".to_string(), "FerryToggle".into(), "KWin".into(), "Ferry: Carry Mouse and Keyboard to the Mac".into()];
+    let ours = vec!["kwin".to_string(), "BatonPassToggle".into(), "KWin".into(), "Baton Pass: Carry Mouse and Keyboard to the Mac".into()];
     connection
         .call_method(destination, path, interface, method, &(ours, vec![(vec![combination, 0, 0, 0],)], 4u32))
         .await
@@ -173,22 +173,22 @@ clipboard = true
 
 fn desktop_entry(executable: &Path) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName=Ferry\nComment=Carry the mouse and keyboard over to the Mac\nExec={} toggle\nIcon=input-mouse\nNoDisplay=true\n",
+        "[Desktop Entry]\nType=Application\nName=Baton Pass\nComment=Carry the mouse and keyboard over to the Mac\nExec={} toggle\nIcon=input-mouse\nNoDisplay=true\n",
         executable.display()
     )
 }
 
 fn systemd_unit(executable: &Path) -> String {
     format!(
-        "[Unit]\nDescription=Ferry: carry this desktop's mouse and keyboard over to the Mac\nAfter=graphical-session.target\nPartOf=graphical-session.target\n\n[Service]\nExecStart={} run\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=graphical-session.target\n",
+        "[Unit]\nDescription=Baton Pass: carry this desktop's mouse and keyboard over to the Mac\nAfter=graphical-session.target\nPartOf=graphical-session.target\n\n[Service]\nExecStart={} run\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=graphical-session.target\n",
         executable.display()
     )
 }
 
 const METADATA: &str = r#"{
     "KPlugin": {
-        "Id": "ferry",
-        "Name": "Ferry",
+        "Id": "batonpass",
+        "Name": "Baton Pass",
         "Description": "Hotkey that carries the mouse and keyboard over to the Mac",
         "License": "GPL-3.0-or-later",
         "EnabledByDefault": true
@@ -202,9 +202,9 @@ const METADATA: &str = r#"{
 fn kwin_script(shortcut: &str) -> String {
     let shortcut = shortcut.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
-        r#"registerShortcut("FerryToggle", "Ferry: Carry Mouse and Keyboard to the Mac", "{shortcut}", function () {{
+        r#"registerShortcut("BatonPassToggle", "Baton Pass: Carry Mouse and Keyboard to the Mac", "{shortcut}", function () {{
     const position = workspace.cursorPos;
-    callDBus("{APP_ID}", "/dev/ferry/Ferry", "{APP_ID}", "Toggle", String(position.x), String(position.y));
+    callDBus("{APP_ID}", "/dev/batonpass/BatonPass", "{APP_ID}", "Toggle", String(position.x), String(position.y));
 }});
 "#
     )

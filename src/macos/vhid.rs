@@ -3,11 +3,11 @@ use crate::proto::{
 };
 
 unsafe extern "C" {
-    fn ferry_vhid_start(vendor_id: u16, product_id: u16, country_code: u8);
-    fn ferry_vhid_flags() -> u32;
-    fn ferry_vhid_keyboard(modifiers: u8, keys: *const u16, count: usize);
-    fn ferry_vhid_consumer(keys: *const u16, count: usize);
-    fn ferry_vhid_pointing(buttons: u32, x: i8, y: i8, vertical_wheel: i8, horizontal_wheel: i8);
+    fn batonpass_vhid_start(vendor_id: u16, product_id: u16, country_code: u8);
+    fn batonpass_vhid_flags() -> u32;
+    fn batonpass_vhid_keyboard(modifiers: u8, keys: *const u16, count: usize);
+    fn batonpass_vhid_consumer(keys: *const u16, count: usize);
+    fn batonpass_vhid_pointing(buttons: u32, x: i8, y: i8, vertical_wheel: i8, horizontal_wheel: i8);
 }
 
 const APPLE_VENDOR: u16 = 0x05ac;
@@ -16,11 +16,11 @@ const ANSI_KEYBOARD: u16 = 0x024f;
 /// Connects to Karabiner's virtual HID daemon, posing as the same ANSI keyboard Karabiner-Elements
 /// uses so macOS never shows its keyboard setup assistant.
 pub fn start() {
-    unsafe { ferry_vhid_start(APPLE_VENDOR, ANSI_KEYBOARD, 0) }
+    unsafe { batonpass_vhid_start(APPLE_VENDOR, ANSI_KEYBOARD, 0) }
 }
 
 pub fn flags() -> u8 {
-    let raw = unsafe { ferry_vhid_flags() };
+    let raw = unsafe { batonpass_vhid_flags() };
     let mut flags = 0;
     if raw & 1 != 0 {
         flags |= FLAG_VHID_CONNECTED;
@@ -42,13 +42,13 @@ pub fn pointing_ready() -> bool {
 }
 
 pub fn keyboard(state: &KeyState) {
-    unsafe { ferry_vhid_keyboard(state.modifiers, state.keys.as_ptr(), state.keys.len()) }
+    unsafe { batonpass_vhid_keyboard(state.modifiers, state.keys.as_ptr(), state.keys.len()) }
 }
 
 pub fn consumer(keys: &[u16]) {
-    unsafe { ferry_vhid_consumer(keys.as_ptr(), keys.len()) }
+    unsafe { batonpass_vhid_consumer(keys.as_ptr(), keys.len()) }
 }
 
 pub fn pointing(buttons: u32, x: i8, y: i8, vertical_wheel: i8, horizontal_wheel: i8) {
-    unsafe { ferry_vhid_pointing(buttons, x, y, vertical_wheel, horizontal_wheel) }
+    unsafe { batonpass_vhid_pointing(buttons, x, y, vertical_wheel, horizontal_wheel) }
 }

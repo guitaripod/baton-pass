@@ -14,9 +14,9 @@ use tokio::net::TcpStream;
 pub const PORT: u16 = 47475;
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 1024;
-const DESKTOP: &[u8] = b"ferry desktop";
-const MAC: &[u8] = b"ferry mac";
-const CONFIRMATION: &[u8] = b"ferry paired";
+const DESKTOP: &[u8] = b"baton-pass desktop";
+const MAC: &[u8] = b"baton-pass mac";
+const CONFIRMATION: &[u8] = b"baton-pass paired";
 
 #[cfg(any(target_os = "macos", test))]
 /// A fresh eight-digit code, shown as `1234-5678`.
@@ -61,7 +61,7 @@ pub async fn join(address: &str, code: &str, key_path: &Path) -> Result<()> {
     let mut stream = tokio::time::timeout(STEP_TIMEOUT, TcpStream::connect(address))
         .await
         .context("the Mac did not answer")?
-        .with_context(|| format!("connecting to {address} (is `sudo ferry pair` running on the Mac?)"))?;
+        .with_context(|| format!("connecting to {address} (is `sudo baton-pass pair` running on the Mac?)"))?;
     let (spake, outbound) = Spake2::<Ed25519Group>::start_a(&password, &Identity::new(DESKTOP), &Identity::new(MAC));
     write_frame(&mut stream, &outbound).await?;
     let inbound = read_frame(&mut stream).await?;
@@ -75,7 +75,7 @@ pub async fn join(address: &str, code: &str, key_path: &Path) -> Result<()> {
     crypto::write_key(key_path, &key)
 }
 
-/// `sudo ferry pair` on the Mac: shows a code, waits three minutes for the desktop to prove
+/// `sudo baton-pass pair` on the Mac: shows a code, waits three minutes for the desktop to prove
 /// it, then restarts the daemon on the new key.
 #[cfg(target_os = "macos")]
 pub async fn on_mac() -> Result<()> {
@@ -83,20 +83,20 @@ pub async fn on_mac() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await.with_context(|| format!("listening on port {PORT}"))?;
     let code = new_code();
     println!("Pairing code: {code}");
-    println!("On the desktop, run:  ferry pair {code}");
+    println!("On the desktop, run:  baton-pass pair {code}");
     let (mut stream, from) = tokio::time::timeout(Duration::from_secs(180), listener.accept())
         .await
         .context("no desktop paired within three minutes")??;
     host(&mut stream, &code, &key_path).await.with_context(|| format!("pairing with {from}"))?;
-    let restarted = tokio::process::Command::new("/bin/launchctl").args(["kickstart", "-k", "system/dev.ferry.ferry"]).status().await;
+    let restarted = tokio::process::Command::new("/bin/launchctl").args(["kickstart", "-k", "system/dev.batonpass.BatonPass"]).status().await;
     if !restarted.is_ok_and(|status| status.success()) {
-        println!("restart the daemon to use the new key: sudo launchctl kickstart -k system/dev.ferry.ferry");
+        println!("restart the daemon to use the new key: sudo launchctl kickstart -k system/dev.batonpass.BatonPass");
     }
     println!("Paired with {}; the key is in {}", from.ip(), key_path.display());
     Ok(())
 }
 
-/// `ferry pair CODE` on the desktop: proves the code shown on the Mac, then restarts the
+/// `baton-pass pair CODE` on the desktop: proves the code shown on the Mac, then restarts the
 /// service on the new key.
 #[cfg(target_os = "linux")]
 pub async fn on_desktop(code: &str, peer: Option<String>) -> Result<()> {
@@ -110,7 +110,7 @@ pub async fn on_desktop(code: &str, peer: Option<String>) -> Result<()> {
     };
     let key_path = crate::config::Config::key_path();
     join(&format!("{host}:{PORT}"), code, &key_path).await?;
-    let _ = tokio::process::Command::new("systemctl").args(["--user", "try-restart", "ferry.service"]).status().await;
+    let _ = tokio::process::Command::new("systemctl").args(["--user", "try-restart", "baton-pass.service"]).status().await;
     println!("Paired with the Mac at {host}; the key is in {}", key_path.display());
     Ok(())
 }
@@ -118,7 +118,7 @@ pub async fn on_desktop(code: &str, peer: Option<String>) -> Result<()> {
 /// The key both sides derived, separated from any other use of the SPAKE2 output.
 fn session_cipher(shared: Vec<u8>) -> Cipher {
     let mut hasher = Sha256::new();
-    hasher.update(b"ferry pairing key");
+    hasher.update(b"baton-pass pairing key");
     hasher.update(&shared);
     Cipher::from_secret(hasher.finalize().into())
 }
@@ -154,7 +154,7 @@ mod tests {
     use super::*;
 
     fn temporary(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("ferry-pair-{}-{name}", std::process::id())).join("key")
+        std::env::temp_dir().join(format!("baton-pass-pair-{}-{name}", std::process::id())).join("key")
     }
 
     async fn pair(mac_code: &str, desktop_code: &str, mac_key: &Path, desktop_key: &Path) -> (Result<()>, Result<()>) {
