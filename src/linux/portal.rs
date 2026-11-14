@@ -241,16 +241,17 @@ pub fn edge_fraction(region: Region, side: Side, x: f64, y: f64) -> f32 {
     fraction.clamp(0.0, 1.0) as f32
 }
 
-/// The point just inside the edge at `fraction`, where the cursor reappears on return.
-pub fn edge_point(region: Region, side: Side, fraction: f32) -> (f64, f64) {
+/// The point `inset` pixels inside the edge at `fraction`, where the cursor reappears.
+pub fn edge_point(region: Region, side: Side, fraction: f32, inset: f64) -> (f64, f64) {
     let (x, y) = (region.x_offset() as f64, region.y_offset() as f64);
     let (w, h) = (region.width() as f64, region.height() as f64);
     let fraction = fraction.clamp(0.0, 1.0) as f64;
+    let inset = inset.clamp(1.0, (w.min(h) / 2.0).max(1.0));
     match side {
-        Side::Left => (x + 1.0, y + fraction * (h - 1.0)),
-        Side::Right => (x + w - 2.0, y + fraction * (h - 1.0)),
-        Side::Top => (x + fraction * (w - 1.0), y + 1.0),
-        Side::Bottom => (x + fraction * (w - 1.0), y + h - 2.0),
+        Side::Left => (x + inset, y + fraction * (h - 1.0)),
+        Side::Right => (x + w - 1.0 - inset, y + fraction * (h - 1.0)),
+        Side::Top => (x + fraction * (w - 1.0), y + inset),
+        Side::Bottom => (x + fraction * (w - 1.0), y + h - 1.0 - inset),
     }
 }
 

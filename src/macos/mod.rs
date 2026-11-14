@@ -26,6 +26,7 @@ const PUSH_MEMORY: Duration = Duration::from_millis(60);
 const CALIBRATION_COUNTS: i8 = 60;
 const PARKING_LIMIT: Duration = Duration::from_millis(500);
 const CHALLENGE_LIFETIME: Duration = Duration::from_secs(5);
+const EXIT_ARM_DISTANCE: f64 = 24.0;
 
 /// Counts posted since `start` was read, for re-measuring the count-to-point ratio during use.
 struct Window {
@@ -56,6 +57,7 @@ struct Receiver {
     exiting: Option<(f32, Instant)>,
     exit_side: Side,
     exit_enabled: bool,
+    exit_armed: bool,
     speed: f32,
     keys: KeyState,
     buttons: u32,
@@ -97,6 +99,7 @@ pub async fn run(config: Config) -> Result<()> {
         exiting: None,
         exit_side: Side::Right,
         exit_enabled: true,
+        exit_armed: false,
         speed: 1.0,
         keys: KeyState::default(),
         buttons: 0,
@@ -251,6 +254,7 @@ impl Receiver {
         self.release_all();
         self.entered = true;
         self.exiting = None;
+        self.exit_armed = false;
         self.exit_side = arch_side.opposite();
         self.speed = speed.clamp(0.05, 20.0);
         self.remainder = (0.0, 0.0);
@@ -451,10 +455,13 @@ impl Receiver {
         self.refresh_displays(false);
         let Some(cursor) = display::cursor() else { return };
         self.learn_ratio(cursor);
+        if !self.exit_armed {
+            self.exit_armed = distance_from_edge(&self.displays, self.exit_side, cursor) >= EXIT_ARM_DISTANCE;
+        }
         let pushing = self.pushed.filter(|(_, _, at)| at.elapsed() < PUSH_MEMORY).map(|(dx, dy, _)| (dx, dy));
         match edge_decision(&self.displays, self.exit_side, cursor, pushing, self.inset()) {
             EdgeDecision::Stay => {}
-            EdgeDecision::Exit { park, .. } if !self.exit_enabled => {
+            EdgeDecision::Exit { park, .. } if !self.exit_enabled || !self.exit_armed => {
                 self.nudge_to(park);
             }
             EdgeDecision::Exit { frac, park } => {
@@ -593,6 +600,22 @@ fn edge_rect(displays: &[Rect], side: Side, along: Option<f64>) -> Option<Rect> 
     .copied()
 }
 
+/// How far the cursor is from the exit edge, so a fresh arrival must move inward before the
+/// same edge can send it back; without this a twitch at the edge bounces between machines.
+fn distance_from_edge(displays: &[Rect], exit: Side, cursor: Point) -> f64 {
+    let along = match exit {
+        Side::Left | Side::Right => cursor.y,
+        Side::Top | Side::Bottom => cursor.x,
+    };
+    let Some(edge) = edge_rect(displays, exit, Some(along)) else { return f64::INFINITY };
+    match exit {
+        Side::Right => edge.max_x() - cursor.x,
+        Side::Left => cursor.x - edge.min_x(),
+        Side::Bottom => edge.max_y() - cursor.y,
+        Side::Top => cursor.y - edge.min_y(),
+    }
+}
+
 /// Decides whether the cursor has left through the exit edge, wandered off the allowed displays
 /// (and must be pulled back), or is fine where it is.
 fn edge_decision(displays: &[Rect], exit: Side, cursor: Point, pushing: Option<(f32, f32)>, inset: f64) -> EdgeDecision {
@@ -725,7 +748,7 @@ mod tests {
         let builtin = [rect(0.0, 0.0, 1512.0, 982.0)];
         let decision = edge_decision(&builtin, Side::Right, Point { x: 1520.0, y: 491.0 }, Some((3.0, 0.0)), 2.0);
         match decision {
-            EdgeDecision::Exit { park, .. } if !self.exit_enabled => {
+            EdgeDecision::Exit { park, .. } if !self.exit_enabled || !self.exit_armed => {
                 self.nudge_to(park);
             }
             EdgeDecision::Exit { frac, park } => {

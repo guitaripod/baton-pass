@@ -37,6 +37,8 @@ const REARM_DELAY: Duration = Duration::from_millis(400);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const REOPEN_DELAY: Duration = Duration::from_secs(2);
 const SLAM_RETRY: Duration = Duration::from_millis(250);
+const RETURN_INSET: f64 = 48.0;
+const BOUNCE_GUARD: Duration = Duration::from_millis(400);
 
 struct Capture {
     activation_id: Option<u32>,
@@ -84,6 +86,7 @@ struct Daemon {
     opening: bool,
     opened: mpsc::UnboundedSender<Result<(Portal, Ei, PortalSignals)>>,
     session_lost: Option<String>,
+    last_release: Option<Instant>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -119,6 +122,7 @@ pub async fn run(config: Config) -> Result<()> {
         opening: false,
         opened: opened_tx,
         session_lost: None,
+        last_release: None,
     };
     let mut ei: Option<Ei> = None;
     let mut streams = Streams::default();
@@ -292,7 +296,7 @@ impl Daemon {
             Some(Incoming::Message(Msg::Ack { flags })) => self.link.flags = flags,
             Some(Incoming::Message(Msg::Exit { frac })) => {
                 if let Some(capture) = &self.capture {
-                    let target = portal::edge_point(capture.edge.region, self.config.side, frac);
+                    let target = portal::edge_point(capture.edge.region, self.config.side, frac, RETURN_INSET);
                     self.release(target, "the cursor left the Mac's edge").await;
                 }
             }
@@ -312,10 +316,12 @@ impl Daemon {
         let entry = activated
             .cursor_position()
             .map(|(x, y)| (x as f64, y as f64))
-            .unwrap_or_else(|| portal::edge_point(edge.region, side, 0.5));
+            .unwrap_or_else(|| portal::edge_point(edge.region, side, 0.5, 1.0));
         let toggled = self.pending_toggle.take().filter(|toggle| toggle.started.elapsed() < TOGGLE_WINDOW);
-        if toggled.is_none() && !self.config.edge {
-            let back = portal::edge_point(edge.region, side, portal::edge_fraction(edge.region, side, entry.0, entry.1));
+        let just_returned = self.last_release.is_some_and(|at| at.elapsed() < BOUNCE_GUARD);
+        if toggled.is_none() && (!self.config.edge || just_returned) {
+            let inset = if just_returned { RETURN_INSET } else { 1.0 };
+            let back = portal::edge_point(edge.region, side, portal::edge_fraction(edge.region, side, entry.0, entry.1), inset);
             if let Err(error) = portal.release(activated.activation_id(), back).await {
                 self.session_lost = Some(format!("releasing an edge crossing failed: {error:#}"));
             }
@@ -337,7 +343,7 @@ impl Daemon {
         if !self.link.connected() {
             capture.return_to = None;
             self.capture = Some(capture);
-            let back = portal::edge_point(edge.region, side, portal::edge_fraction(edge.region, side, entry.0, entry.1));
+            let back = portal::edge_point(edge.region, side, portal::edge_fraction(edge.region, side, entry.0, entry.1), 1.0);
             self.release(back, "the Mac is not linked").await;
             return;
         }
@@ -429,11 +435,12 @@ impl Daemon {
         let Some(capture) = &self.capture else { return (0.0, 0.0) };
         let side = self.config.side;
         let frac = portal::edge_fraction(capture.edge.region, side, capture.entry.0, capture.entry.1);
-        portal::edge_point(capture.edge.region, side, frac)
+        portal::edge_point(capture.edge.region, side, frac, RETURN_INSET)
     }
 
     async fn release(&mut self, target: (f64, f64), reason: &str) {
         let Some(capture) = self.capture.take() else { return };
+        self.last_release = Some(Instant::now());
         tracing::info!("released ({reason}) after {:.1} s", capture.since.elapsed().as_secs_f32());
         self.link.send(Msg::Leave).await;
         if let Some(portal) = &self.portal

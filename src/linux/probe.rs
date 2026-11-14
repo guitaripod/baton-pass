@@ -160,6 +160,8 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
     if cross {
         link.send(Msg::Enter { side: Side::Left.to_wire(), frac: 0.25, speed: 1.0, exit: true }).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
+        link.send(Msg::Pointer { dx: -40.0, dy: 0.0, wheel_v: 0, wheel_h: 0, buttons: 0 }).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let started = Instant::now();
         let mut exit = None;
         while exit.is_none() && started.elapsed() < Duration::from_secs(2) {
