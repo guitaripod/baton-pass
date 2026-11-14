@@ -530,7 +530,8 @@ impl Daemon {
         self.link.maintain().await;
         let connected = self.link.connected();
 
-        if self.capture.is_some() && (!connected || self.link.last_heard.elapsed() > FAILSAFE) {
+        let silent = self.capture.as_ref().is_some_and(|capture| self.link.last_heard.max(capture.since).elapsed() > FAILSAFE);
+        if self.capture.is_some() && (!connected || silent) {
             let target = self
                 .capture
                 .as_ref()

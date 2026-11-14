@@ -263,6 +263,64 @@ impl Hotkey {
     pub fn qt_name(&self) -> &str {
         &self.qt_name
     }
+
+    /// The key combination as Qt encodes it (modifier flags OR'd with the key code), which is
+    /// how kglobalaccel reports which actions own a shortcut.
+    pub fn qt_combination(&self) -> Option<i32> {
+        let key = qt_key(self.key)?;
+        let mut combination = key;
+        if self.modifiers.shift {
+            combination |= 0x0200_0000;
+        }
+        if self.modifiers.ctrl {
+            combination |= 0x0400_0000;
+        }
+        if self.modifiers.alt {
+            combination |= 0x0800_0000;
+        }
+        if self.modifiers.meta {
+            combination |= 0x1000_0000;
+        }
+        Some(combination)
+    }
+}
+
+fn qt_key(code: u32) -> Option<i32> {
+    const LETTERS: [u32; 26] = [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44];
+    if let Some(index) = LETTERS.iter().position(|letter| *letter == code) {
+        return Some(0x41 + index as i32);
+    }
+    Some(match code {
+        2..=10 => 0x31 + (code as i32 - 2),
+        11 => 0x30,
+        59..=68 => 0x0100_0030 + (code as i32 - 59),
+        87 => 0x0100_003a,
+        88 => 0x0100_003b,
+        183..=194 => 0x0100_003c + (code as i32 - 183),
+        KEY_ESC => 0x0100_0000,
+        15 => 0x0100_0001,
+        14 => 0x0100_0003,
+        28 => 0x0100_0004,
+        110 => 0x0100_0006,
+        111 => 0x0100_0007,
+        119 => 0x0100_0008,
+        99 => 0x0100_0009,
+        102 => 0x0100_0010,
+        107 => 0x0100_0011,
+        105 => 0x0100_0012,
+        103 => 0x0100_0013,
+        106 => 0x0100_0014,
+        108 => 0x0100_0015,
+        104 => 0x0100_0016,
+        109 => 0x0100_0017,
+        70 => 0x0100_0026,
+        57 => 0x20,
+        41 => 0x60,
+        43 => 0x5c,
+        12 => 0x2d,
+        13 => 0x3d,
+        _ => return None,
+    })
 }
 
 fn key_by_name(name: &str) -> Option<(u32, String)> {
@@ -379,6 +437,13 @@ mod tests {
         let meta_alt: BTreeSet<u32> = [KEY_LEFTMETA, KEY_LEFTALT, KEY_ESC].into_iter().collect();
         assert!(!hotkey.matches(KEY_ESC, &meta_alt));
         assert!(!hotkey.matches(30, &meta));
+    }
+
+    #[test]
+    fn qt_combinations_match_kglobalaccel() {
+        assert_eq!(Hotkey::parse("Meta+Escape").unwrap().qt_combination(), Some(285212672));
+        assert_eq!(Hotkey::parse("Meta+F12").unwrap().qt_combination(), Some(285212731));
+        assert_eq!(Hotkey::parse("Ctrl+Alt+K").unwrap().qt_combination(), Some(0x0c00_004b));
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub async fn install(peers: Vec<String>) -> Result<()> {
     let main_script = script_dir.join("contents/code/main.js");
     write(&main_script, &kwin_script(hotkey.qt_name()))?;
     load_kwin_script(&main_script).await?;
+    claim_shortcut(&hotkey).await?;
 
     let unit = home.join(".config/systemd/user/ferry.service");
     write(&unit, &systemd_unit(&executable))?;
@@ -114,6 +115,37 @@ fn with_peers(config: &str, peers: &[String]) -> String {
         lines.insert(0, line);
     }
     lines.join("\n") + "\n"
+}
+
+/// Makes the hotkey ferry's alone: kglobalaccel hands a key to the first action that has it,
+/// and Plasma ships Meta+Esc as System Monitor's launcher, so other owners are unbound.
+async fn claim_shortcut(hotkey: &Hotkey) -> Result<()> {
+    let Some(combination) = hotkey.qt_combination() else { return Ok(()) };
+    let connection = zbus::Connection::session().await?;
+    let call = |method: &'static str| (Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), method);
+    let (destination, path, interface, method) = call("getGlobalShortcutsByKey");
+    type Owner = (String, String, String, String, String, String, Vec<i32>, Vec<i32>);
+    let owners: Vec<Owner> =
+        connection.call_method(destination, path, interface, method, &(combination,)).await?.body().deserialize()?;
+    for (unique, friendly, component, component_friendly, ..) in owners {
+        if component == "kwin" && unique == "FerryToggle" {
+            continue;
+        }
+        let (destination, path, interface, method) = call("setShortcutKeys");
+        let action = vec![component.clone(), unique.clone(), component_friendly, friendly.clone()];
+        connection
+            .call_method(destination, path, interface, method, &(action, Vec::<(Vec<i32>,)>::new(), 4u32))
+            .await
+            .with_context(|| format!("unbinding {} from {friendly}", hotkey.qt_name()))?;
+        println!("took {} from \"{friendly}\" ({component})", hotkey.qt_name());
+    }
+    let (destination, path, interface, method) = call("setShortcutKeys");
+    let ours = vec!["kwin".to_string(), "FerryToggle".into(), "KWin".into(), "Ferry: Carry Mouse and Keyboard to the Mac".into()];
+    connection
+        .call_method(destination, path, interface, method, &(ours, vec![(vec![combination, 0, 0, 0],)], 4u32))
+        .await
+        .context("binding the hotkey")?;
+    Ok(())
 }
 
 fn default_config(peers: &[String]) -> String {
