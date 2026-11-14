@@ -37,6 +37,8 @@ Mac (needs Karabiner-Elements or Karabiner-DriverKit-VirtualHIDDevice installed)
 scripts/install-mac.sh
 ```
 
+It signs the binary with a Developer ID (hardened runtime, secure timestamp) when `~/Library/Keychains/baton-pass-signing.keychain-db` and its password file in `~/.appstoreconnect/private_keys` exist, and ad hoc otherwise. With a Developer ID signature, a Full Disk Access grant for `/usr/local/bin/baton-pass` survives updates; it is what lets files copied from Desktop, Documents or Downloads travel.
+
 Then pair the two, which puts one fresh key on both (`~/.config/baton-pass/key` on Arch, `/usr/local/etc/baton-pass/key` on the Mac, mode 600). On the Mac:
 
 ```sh
