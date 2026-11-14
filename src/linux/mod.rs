@@ -661,6 +661,7 @@ impl Daemon {
         if self.link.last_heard.elapsed() > HEARTBEAT_CAPTURED * 2 {
             self.drain_link().await;
         }
+        self.link.allow_roaming(self.capture.is_none() && self.pending_toggle.is_none());
         self.link.maintain().await;
         let connected = self.link.connected();
 

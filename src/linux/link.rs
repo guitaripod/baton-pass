@@ -12,6 +12,7 @@ const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const NONCE_MEMORY: usize = 4;
 const SEND_WARNING_INTERVAL: Duration = Duration::from_secs(5);
+const ROAM_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The encrypted UDP session with the Mac: handshake, replay protection and liveness.
 pub struct Link {
@@ -31,6 +32,8 @@ pub struct Link {
     silence: Silence,
     resolved: Rc<RefCell<HashMap<String, SocketAddr>>>,
     last_send_warning: Option<Instant>,
+    roam_allowed: bool,
+    last_roam: Option<Instant>,
     pub flags: u8,
 }
 
@@ -59,6 +62,8 @@ impl Link {
             silence: Silence::default(),
             resolved: Rc::new(RefCell::new(HashMap::new())),
             last_send_warning: None,
+            roam_allowed: false,
+            last_roam: None,
             flags: 0,
         })
     }
@@ -99,13 +104,26 @@ impl Link {
         self.silence.heard();
     }
 
+    /// Lets the link move to the first configured peer while nothing is captured: a new
+    /// session replaces the Mac's current one, which would end control in the middle of use.
+    pub fn allow_roaming(&mut self, allowed: bool) {
+        self.roam_allowed = allowed;
+        if !allowed {
+            self.joining = self.joining.filter(|_| !self.connected());
+        }
+    }
+
     /// Greets one configured peer per interval, in order, so the wired address wins whenever it
     /// answers and the tailnet name is only a fallback; drops a session that went silent.
     pub async fn maintain(&mut self) {
         if self.connected() && self.quiet() > IDLE_TIMEOUT {
             self.disconnect("no reply for 3 s");
         }
-        if self.connected() || self.last_hello.is_some_and(|sent| sent.elapsed() < HELLO_INTERVAL) {
+        if self.connected() {
+            self.roam().await;
+            return;
+        }
+        if self.last_hello.is_some_and(|sent| sent.elapsed() < HELLO_INTERVAL) {
             return;
         }
         self.last_hello = Some(Instant::now());
@@ -125,6 +143,33 @@ impl Link {
         {
             tracing::debug!("hello to {address}: {error}");
         }
+    }
+
+    /// Linked through a fallback (the tailnet) while the first configured peer (the wired
+    /// address) may be back: greets the first peer now and then, and a completed handshake
+    /// with it moves the session over.
+    async fn roam(&mut self) {
+        let Some(first) = self.peers.first().cloned() else { return };
+        let Some(preferred) = self.address_of(&first) else { return };
+        if !self.roam_allowed || self.peer == Some(preferred) || self.last_roam.is_some_and(|at| at.elapsed() < ROAM_INTERVAL) {
+            return;
+        }
+        self.last_roam = Some(Instant::now());
+        let nonce = random_u64();
+        if self.nonces.len() == NONCE_MEMORY {
+            self.nonces.pop_front();
+        }
+        self.nonces.push_back(nonce);
+        let packet = self.seal(0, Msg::Hello { nonce });
+        if let Err(error) = self.socket.send_to(&packet, preferred).await {
+            tracing::debug!("hello to {preferred}: {error}");
+        }
+    }
+
+    /// Whether a handshake packet from `from` may proceed: always when unlinked, and from a
+    /// better address than the current one while roaming is allowed.
+    fn may_handshake(&self, from: SocketAddr) -> bool {
+        !self.connected() || (self.roam_allowed && self.peer != Some(from))
     }
 
     /// The address for a configured peer. Literal addresses are used as they are; names are
@@ -180,7 +225,7 @@ impl Link {
     pub async fn accept(&mut self, packet: &[u8], from: SocketAddr) -> Option<Incoming> {
         let envelope = Envelope::decode(&self.cipher.open(packet)?)?;
         match envelope.msg {
-            Msg::Challenge { nonce, challenge } if !self.connected() && self.nonces.contains(&nonce) => {
+            Msg::Challenge { nonce, challenge } if self.may_handshake(from) && self.nonces.contains(&nonce) => {
                 self.joining = Some((from, nonce));
                 let join = self.seal(0, Msg::Join { nonce, challenge });
                 if let Err(error) = self.socket.send_to(&join, from).await {
@@ -188,7 +233,10 @@ impl Link {
                 }
                 None
             }
-            Msg::Welcome { nonce, token } if !self.connected() && self.joining == Some((from, nonce)) => {
+            Msg::Welcome { nonce, token } if self.may_handshake(from) && self.joining == Some((from, nonce)) => {
+                if let Some(previous) = self.peer.filter(|_| self.connected()) {
+                    tracing::info!("moving the link from {previous} to {from}");
+                }
                 self.token = Some(token);
                 self.peer = Some(from);
                 self.peer_counter = envelope.counter;

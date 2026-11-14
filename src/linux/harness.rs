@@ -120,6 +120,19 @@ struct Run {
 /// silence, maintains the link and heartbeats at the captured cadence, with replies read as
 /// they arrive. Calls `during` once per tick with the elapsed time.
 async fn drive(faults: Faults, length: Duration, seed: u64, during: impl Fn(Duration, &FakeMac)) -> (Run, Rc<FakeMac>) {
+    let (run, mac, _) = drive_paths(&[faults], length, seed, during).await;
+    (run, mac)
+}
+
+/// Like `drive`, with one relay per entry of `paths`, configured as peers in that order (the
+/// first standing for the wired address, the rest for fallbacks). Also returns the relay
+/// addresses and the address the link ended on.
+async fn drive_paths(
+    paths: &[Faults],
+    length: Duration,
+    seed: u64,
+    during: impl Fn(Duration, &FakeMac),
+) -> (Run, Rc<FakeMac>, (Vec<SocketAddr>, Option<SocketAddr>)) {
     let cipher = Rc::new(Cipher::from_key(KEY));
     let mac = Rc::new(FakeMac {
         socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
@@ -129,12 +142,16 @@ async fn drive(faults: Faults, length: Duration, seed: u64, during: impl Fn(Dura
     });
     let mac_address = mac.socket.local_addr().unwrap();
     tokio::task::spawn_local(mac.clone().serve(cipher.clone()));
-    let relay_socket = Rc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let relay_address = relay_socket.local_addr().unwrap();
     let started = Instant::now();
-    tokio::task::spawn_local(relay(relay_socket, mac_address, faults, started, seed));
+    let mut relays = Vec::new();
+    for (index, faults) in paths.iter().enumerate() {
+        let relay_socket = Rc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        relays.push(relay_socket.local_addr().unwrap());
+        tokio::task::spawn_local(relay(relay_socket, mac_address, *faults, started, seed + index as u64));
+    }
 
-    let mut link = Link::new(cipher, vec![relay_address.to_string()]).await.unwrap();
+    let mut link = Link::new(cipher, relays.iter().map(SocketAddr::to_string).collect()).await.unwrap();
+    link.allow_roaming(true);
     let mut run = Run::default();
     let mut ticker = tokio::time::interval(TICK);
     let mut last_heartbeat = Instant::now();
@@ -176,7 +193,8 @@ async fn drive(faults: Faults, length: Duration, seed: u64, during: impl Fn(Dura
             }
         }
     }
-    (run, mac)
+    let ended_on = link.peer.filter(|_| link.connected());
+    (run, mac, (relays, ended_on))
 }
 
 fn local<F: std::future::Future>(future: F) -> F::Output {
@@ -222,4 +240,12 @@ fn a_restarted_mac_resets_the_session_and_it_links_again() {
     }));
     assert_eq!((run.links, run.drops), (2, 1), "{run:?}");
     assert_eq!(run.failsafe_trips, 0, "{run:?}");
+}
+
+#[test]
+fn moves_back_to_the_wired_path_once_it_answers() {
+    let wired_down = Faults { blackout: Some((Duration::ZERO, Duration::from_secs(2))), ..Default::default() };
+    let (run, _, (relays, ended_on)) = local(drive_paths(&[wired_down, Faults::default()], Duration::from_secs(9), 17, |_, _| {}));
+    assert_eq!(ended_on, Some(relays[0]), "{run:?}");
+    assert_eq!((run.links, run.drops, run.failsafe_trips), (2, 0, 0), "{run:?}");
 }
