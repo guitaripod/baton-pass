@@ -23,7 +23,11 @@ const SILENCE_LIMIT: Duration = Duration::from_millis(500);
 const DISPLAY_REFRESH: Duration = Duration::from_secs(1);
 const EXIT_RESEND: Duration = Duration::from_millis(30);
 const PUSH_MEMORY: Duration = Duration::from_millis(60);
-const CALIBRATION_COUNTS: i8 = 60;
+const CALIBRATION_COUNTS: i8 = 120;
+const CALIBRATION_REPORTS: i32 = 2;
+const RATIO_SAMPLES: usize = 7;
+const RATIO_SHIFT: f64 = 0.12;
+const NUDGE_SETTLE: Duration = Duration::from_millis(20);
 const PARKING_LIMIT: Duration = Duration::from_millis(500);
 const CHALLENGE_LIFETIME: Duration = Duration::from_secs(5);
 const EXIT_ARM_DISTANCE: f64 = 24.0;
@@ -69,6 +73,8 @@ struct Receiver {
     pointer_was_ready: bool,
     recalibrate: bool,
     window: Option<Window>,
+    ratio_samples: Vec<f64>,
+    last_nudge: Option<Instant>,
     parking: Option<(Point, Instant)>,
     displays: Vec<Rect>,
     displays_at: Option<Instant>,
@@ -111,6 +117,8 @@ pub async fn run(config: Config) -> Result<()> {
         pointer_was_ready: false,
         recalibrate: false,
         window: None,
+        ratio_samples: Vec::new(),
+        last_nudge: None,
         parking: None,
         displays: Vec::new(),
         displays_at: None,
@@ -274,6 +282,7 @@ impl Receiver {
                 && let Some(first) = self.displays.first().copied() {
                     self.move_to(first.center()).await;
                 }
+        self.last_nudge = Some(Instant::now());
         tracing::info!("in control (entered at {})", if frac.is_finite() { format!("{frac:.2}") } else { "hotkey".into() });
     }
 
@@ -342,11 +351,14 @@ impl Receiver {
         post_motion(buttons, &mut x, &mut y, &mut vertical, &mut horizontal);
     }
 
-    /// Refines the count-to-point ratio from real use: over each tenth of a second, compares
-    /// how far the cursor actually went with how many counts were posted. This tracks changes
-    /// to the Mac's tracking speed, and LinearMouse settling, without moving the cursor itself.
+    /// Watches for the count-to-point ratio changing under ferry (LinearMouse applying its
+    /// profile, a new tracking speed) by comparing, over each tenth of a second, how far the
+    /// cursor went with how many counts were posted. Windows that overlap ferry's own corrective
+    /// nudges are skipped, and the ratio only moves on a sustained shift (see `shifted_ratio`),
+    /// so the pointer speed never wobbles with measurement noise.
     fn learn_ratio(&mut self, cursor: Point) {
         const MARGIN: f64 = 24.0;
+        const MIN_TRAVEL: f64 = 40.0;
         let inside = |point: Point| {
             self.displays.iter().any(|rect| {
                 point.x >= rect.min_x() + MARGIN
@@ -364,14 +376,21 @@ impl Receiver {
         }
         let posted = window.posted.0.hypot(window.posted.1);
         let moved = (cursor.x - window.start.x).hypot(cursor.y - window.start.y);
-        if posted >= 40.0 && inside(window.start) && inside(cursor) {
+        let ratio = self.points_per_count.unwrap_or(1.0);
+        let disturbed = self.last_nudge.is_some_and(|at| at + NUDGE_SETTLE > window.opened);
+        if !disturbed && posted * ratio >= MIN_TRAVEL && inside(window.start) && inside(cursor) {
             let sample = moved / posted;
             if (0.05..=10.0).contains(&sample) {
-                let ratio = self.points_per_count.map_or(sample, |ratio| ratio * 0.7 + sample * 0.3);
-                if self.points_per_count.is_some_and(|old| (old - ratio).abs() / old > 0.05) {
-                    tracing::info!("virtual mouse now moves {ratio:.3} points per count");
+                if self.ratio_samples.len() == RATIO_SAMPLES {
+                    self.ratio_samples.remove(0);
                 }
-                self.points_per_count = Some(ratio);
+                self.ratio_samples.push(sample);
+                if let Some(shifted) = shifted_ratio(&self.ratio_samples, ratio) {
+                    tracing::info!("virtual mouse now moves {shifted:.3} points per count; re-measuring when idle");
+                    self.points_per_count = Some(shifted);
+                    self.ratio_samples.clear();
+                    self.recalibrate = true;
+                }
             }
         }
         self.window = Some(Window { start: cursor, opened: Instant::now(), posted: (0.0, 0.0) });
@@ -463,6 +482,7 @@ impl Receiver {
             EdgeDecision::Stay => {}
             EdgeDecision::Exit { park, .. } if !self.exit_enabled || !self.exit_armed => {
                 self.nudge_to(park);
+                self.last_nudge = Some(Instant::now());
             }
             EdgeDecision::Exit { frac, park } => {
                 vhid::pointing(0, 0, 0, 0, 0);
@@ -474,6 +494,7 @@ impl Receiver {
             }
             EdgeDecision::Clamp(point) => {
                 self.nudge_to(point);
+                self.last_nudge = Some(Instant::now());
             }
         }
     }
@@ -523,19 +544,24 @@ impl Receiver {
         };
         let direction: i8 = if start.x < area.center().x { 1 } else { -1 };
         let mut samples = Vec::with_capacity(2);
+        let counts = (CALIBRATION_COUNTS as i32 * CALIBRATION_REPORTS) as f64;
         for _ in 0..2 {
             let Some(from) = display::cursor() else { return };
-            vhid::pointing(0, direction * CALIBRATION_COUNTS, 0, 0, 0);
+            for _ in 0..CALIBRATION_REPORTS {
+                vhid::pointing(0, direction * CALIBRATION_COUNTS, 0, 0, 0);
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
             let reached = display::cursor();
-            vhid::pointing(0, -direction * CALIBRATION_COUNTS, 0, 0, 0);
+            for _ in 0..CALIBRATION_REPORTS {
+                vhid::pointing(0, -direction * CALIBRATION_COUNTS, 0, 0, 0);
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
             let Some(reached) = reached else { return };
             if (reached.y - from.y).abs() > 1.0 {
                 tracing::info!("calibration disturbed by other pointer movement; retrying later");
                 return;
             }
-            samples.push((reached.x - from.x) * direction as f64 / CALIBRATION_COUNTS as f64);
+            samples.push((reached.x - from.x) * direction as f64 / counts);
         }
         let (first, second) = (samples[0], samples[1]);
         if first <= 0.02 || second <= 0.02 || (first - second).abs() > 0.05 * first.max(second) {
@@ -545,8 +571,22 @@ impl Receiver {
         let ratio = (first + second) / 2.0;
         tracing::info!("virtual mouse moves {ratio:.3} points per count");
         self.points_per_count = Some(ratio);
+        self.ratio_samples.clear();
         self.recalibrate = false;
     }
+}
+
+/// The ratio to switch to once the last `RATIO_SAMPLES` measurements agree it has moved: their
+/// median, when it differs from `ratio` by more than `RATIO_SHIFT`. Real changes (a profile
+/// applied, a new tracking speed) are step changes far beyond that; anything smaller is noise.
+fn shifted_ratio(samples: &[f64], ratio: f64) -> Option<f64> {
+    if samples.len() < RATIO_SAMPLES {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    ((median - ratio).abs() / ratio > RATIO_SHIFT).then_some(median)
 }
 
 /// Posts a relative pointer move, split into reports that fit the virtual mouse's 8-bit fields.
@@ -797,5 +837,14 @@ mod tests {
         ));
         let top_pinned = Point { x: 700.0, y: 0.0 };
         assert_eq!(edge_decision(&builtin, Side::Top, top_pinned, None, 2.0), EdgeDecision::Stay);
+    }
+
+    #[test]
+    fn ratio_ignores_noise_and_follows_real_shifts() {
+        let noisy = [0.69, 0.74, 0.37, 0.66, 0.71, 0.62, 0.70];
+        assert_eq!(shifted_ratio(&noisy, 0.6875), None);
+        assert_eq!(shifted_ratio(&noisy[..6], 0.229), None);
+        let profile_applied = [0.23, 0.229, 0.4, 0.228, 0.231, 0.7, 0.229];
+        assert_eq!(shifted_ratio(&profile_applied, 0.6875), Some(0.23));
     }
 }
