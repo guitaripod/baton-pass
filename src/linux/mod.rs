@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 const TICK: Duration = Duration::from_millis(25);
 const HEARTBEAT_CAPTURED: Duration = Duration::from_millis(100);
 const HEARTBEAT_IDLE: Duration = Duration::from_secs(1);
-const FAILSAFE: Duration = Duration::from_millis(750);
+const FAILSAFE: Duration = Duration::from_millis(1500);
 const TOGGLE_WINDOW: Duration = Duration::from_millis(1500);
 const REARM_DELAY: Duration = Duration::from_millis(400);
 const RETRY_DELAY: Duration = Duration::from_secs(5);

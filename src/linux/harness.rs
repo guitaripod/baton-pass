@@ -195,12 +195,12 @@ fn stays_linked_through_loss_duplicates_and_reordering() {
 }
 
 #[test]
-fn rides_out_a_short_blackout() {
-    let blackout = Some((Duration::from_millis(1500), Duration::from_millis(1900)));
+fn rides_out_a_one_second_blackout() {
+    let blackout = Some((Duration::from_millis(1500), Duration::from_millis(2500)));
     let faults = Faults { blackout, ..Default::default() };
     let (run, _) = local(drive(faults, Duration::from_secs(4), 7, |_, _| {}));
     assert_eq!((run.links, run.drops, run.failsafe_trips), (1, 0, 0), "{run:?}");
-    assert!(run.longest_quiet >= Duration::from_millis(350), "the blackout did not happen: {run:?}");
+    assert!(run.longest_quiet >= Duration::from_millis(900), "the blackout did not happen: {run:?}");
 }
 
 #[test]
