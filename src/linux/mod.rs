@@ -6,6 +6,7 @@ mod link;
 mod portal;
 pub mod probe;
 mod slam;
+mod tray;
 
 use crate::config::{Config, Side};
 use crate::crypto::{Cipher, Counter};
@@ -20,7 +21,7 @@ use portal::{Edge, Ei, Portal, PortalSignals};
 use reis::ei::button::ButtonState;
 use reis::ei::keyboard::KeyState as EiKeyState;
 use reis::event::EiEvent;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::pending;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -42,6 +43,7 @@ const BOUNCE_GUARD: Duration = Duration::from_millis(400);
 const STRAY_PERSIST: Duration = Duration::from_millis(250);
 const STRAY_GAP: Duration = Duration::from_millis(150);
 const STRAY_ESCALATE: Duration = Duration::from_secs(4);
+const HICCUP_MEMORY: usize = 20;
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(1);
 const SLOW_HANDLER: Duration = Duration::from_millis(50);
 const LATE_TICK: Duration = Duration::from_millis(150);
@@ -96,6 +98,10 @@ struct Daemon {
     last_stray_release: Option<Instant>,
     stray: Option<(Instant, Instant)>,
     last_tick: Option<Instant>,
+    tray: Option<tray::Tray>,
+    rtt: Option<Duration>,
+    hiccups: VecDeque<(Instant, String)>,
+    was_connected: bool,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -105,6 +111,7 @@ pub async fn run(config: Config) -> Result<()> {
         anyhow::bail!("no peers configured in {}", Config::path().display());
     }
     let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    let requests_tx_for_tray = requests_tx.clone();
     let bus = control::serve(requests_tx).await?;
     let slammer = slam::Slammer::new()
         .inspect_err(|error| tracing::warn!("hotkey pointer unavailable (/dev/uinput): {error}"))
@@ -135,7 +142,15 @@ pub async fn run(config: Config) -> Result<()> {
         last_stray_release: None,
         stray: None,
         last_tick: None,
+        tray: None,
+        rtt: None,
+        hiccups: VecDeque::new(),
+        was_connected: false,
     };
+    match tray::Tray::start(&daemon.bus, requests_tx_for_tray, daemon.look()).await {
+        Ok(tray) => daemon.tray = Some(tray),
+        Err(error) => tracing::warn!("system tray icon unavailable: {error}"),
+    }
     let mut ei: Option<Ei> = None;
     let mut streams = Streams::default();
     daemon.start_opening();
@@ -323,7 +338,10 @@ impl Daemon {
                 self.rearm_at = Some(Instant::now());
                 self.last_heartbeat = Instant::now() - HEARTBEAT_IDLE;
             }
-            Some(Incoming::Message(Msg::Ack { flags })) => self.link.flags = flags,
+            Some(Incoming::Message(Msg::Ack { flags })) => {
+                self.link.flags = flags;
+                self.rtt = Some(self.last_heartbeat.elapsed());
+            }
             Some(Incoming::Message(Msg::Exit { frac })) => {
                 if let Some(capture) = &self.capture {
                     let target = portal::edge_point(capture.edge.region, self.config.side, frac, RETURN_INSET);
@@ -632,6 +650,7 @@ impl Daemon {
         self.link.note_running(gap.min(TICK * 2));
         if gap > LATE_TICK {
             tracing::warn!("event loop stalled: {} ms between ticks", gap.as_millis());
+            self.note_hiccup(format!("ferry stalled for {} ms", gap.as_millis()));
             if self.capture.is_some() && self.link.connected() {
                 self.heartbeat().await;
             }
@@ -655,6 +674,7 @@ impl Daemon {
                 .and_then(|capture| capture.return_to)
                 .unwrap_or_else(|| self.return_point());
             self.release(target, "the Mac stopped answering").await;
+            self.note_hiccup("the Mac stopped answering; input came back here".into());
             self.notify("Lost the Mac", "Mouse and keyboard are back on this desktop");
         }
 
@@ -687,6 +707,46 @@ impl Daemon {
         if connected && self.last_heartbeat.elapsed() >= interval {
             self.heartbeat().await;
         }
+
+        if self.was_connected && !connected {
+            self.note_hiccup("lost the link to the Mac".into());
+        }
+        self.was_connected = connected;
+        let look = self.look();
+        if let Some(tray) = self.tray.as_mut() {
+            tray.show(look).await;
+        }
+    }
+
+    fn note_hiccup(&mut self, what: String) {
+        if self.hiccups.len() == HICCUP_MEMORY {
+            self.hiccups.pop_front();
+        }
+        self.hiccups.push_back((Instant::now(), what));
+    }
+
+    /// The tray icon for the current state: which machine has the input, the link, and the
+    /// most recent hiccup, so a drop can be explained after the fact.
+    fn look(&self) -> tray::Look {
+        let connected = self.link.connected();
+        let (icon, status, headline) = match (connected, self.capture.is_some()) {
+            (false, _) => ("network-disconnect", "NeedsAttention", "Ferry is looking for the Mac"),
+            (true, true) => ("computer-laptop", "Active", "Mouse and keyboard are on the Mac"),
+            (true, false) => ("input-mouse", "Passive", "Mouse and keyboard are here"),
+        };
+        let mut details = Vec::new();
+        match self.link.peer.filter(|_| connected) {
+            Some(peer) => details.push(format!("Linked with {}", peer.ip())),
+            None => details.push(format!("Trying {}", self.config.peers.join(", "))),
+        }
+        details.push(format!("{} switches", self.hotkey.qt_name()));
+        let hour = Duration::from_secs(3600);
+        let recent = self.hiccups.iter().filter(|(at, _)| at.elapsed() < hour).count();
+        match self.hiccups.back() {
+            Some((at, what)) => details.push(format!("Last hiccup {}: {what} ({recent} in the last hour)", ago(*at))),
+            None => details.push("No hiccups since ferry started".into()),
+        }
+        tray::Look { icon, status, headline: headline.into(), details: details.join("\n") }
     }
 
     /// Shows a desktop notification without waiting for the notification daemon to answer.
@@ -710,8 +770,9 @@ impl Daemon {
         let mut lines = Vec::new();
         lines.push(match (self.link.token, self.link.peer) {
             (Some(_), Some(peer)) => format!(
-                "link: connected to {peer}, last reply {} ms ago",
-                self.link.last_heard.elapsed().as_millis()
+                "link: connected to {peer}, last reply {} ms ago{}",
+                self.link.last_heard.elapsed().as_millis(),
+                self.rtt.map(|rtt| format!(", round trip {:.2} ms", rtt.as_secs_f64() * 1000.0)).unwrap_or_default()
             ),
             _ => format!("link: looking for {}", self.config.peer_addresses().join(", ")),
         });
@@ -745,6 +806,9 @@ impl Daemon {
             (None, None) if self.opening => "capture: waiting for the input capture permission dialog".into(),
             (None, None) => "capture: no portal session".into(),
         });
+        for (at, what) in self.hiccups.iter().rev().take(5) {
+            lines.push(format!("hiccup {}: {what}", ago(*at)));
+        }
         if let Some(error) = &self.portal_error {
             lines.push(format!("last capture error: {error}"));
         }
@@ -763,6 +827,15 @@ impl Daemon {
         if let Some(portal) = &self.portal {
             portal.close().await;
         }
+    }
+}
+
+/// A coarse "how long ago" for the tray tooltip, stable for a minute at a time.
+fn ago(at: Instant) -> String {
+    match at.elapsed().as_secs() {
+        0..60 => "just now".into(),
+        seconds @ 60..3600 => format!("{} min ago", seconds / 60),
+        seconds => format!("{} h ago", seconds / 3600),
     }
 }
 
