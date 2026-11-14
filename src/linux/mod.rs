@@ -87,6 +87,7 @@ struct Daemon {
     opened: mpsc::UnboundedSender<Result<(Portal, Ei, PortalSignals)>>,
     session_lost: Option<String>,
     last_release: Option<Instant>,
+    last_stray_release: Option<Instant>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -123,6 +124,7 @@ pub async fn run(config: Config) -> Result<()> {
         opened: opened_tx,
         session_lost: None,
         last_release: None,
+        last_stray_release: None,
     };
     let mut ei: Option<Ei> = None;
     let mut streams = Streams::default();
@@ -361,7 +363,12 @@ impl Daemon {
 
     async fn on_ei(&mut self, event: EiEvent) {
         let natural = self.config.natural_scroll;
-        let Some(capture) = self.capture.as_mut() else { return };
+        let Some(capture) = self.capture.as_mut() else {
+            if is_input(&event) {
+                self.release_stray_capture().await;
+            }
+            return;
+        };
         match event {
             EiEvent::PointerMotion(motion) => {
                 capture.motion.0 += motion.dx;
@@ -408,6 +415,22 @@ impl Daemon {
             EiEvent::Disconnected(disconnected) => tracing::warn!("ei disconnected: {:?}", disconnected.reason),
             _ => {}
         }
+    }
+
+    /// Input arriving with no capture of ours means the compositor still holds one (a lost
+    /// Release or a restart mid-capture), which leaves the desktop cursor hidden and dead.
+    /// Disabling the session makes the compositor hand input back.
+    async fn release_stray_capture(&mut self) {
+        if self.last_stray_release.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.last_stray_release = Some(Instant::now());
+        tracing::warn!("input arrived without a capture; handing it back to the desktop");
+        if let Some(portal) = self.portal.as_mut() {
+            portal.armed = true;
+            portal.disarm().await;
+        }
+        self.rearm_at = Some(Instant::now() + REARM_DELAY);
     }
 
     async fn flush_pointer(&mut self) {
@@ -655,6 +678,17 @@ impl Daemon {
             portal.close().await;
         }
     }
+}
+
+fn is_input(event: &EiEvent) -> bool {
+    matches!(
+        event,
+        EiEvent::PointerMotion(_)
+            | EiEvent::Button(_)
+            | EiEvent::ScrollDelta(_)
+            | EiEvent::ScrollDiscrete(_)
+            | EiEvent::KeyboardKey(_)
+    )
 }
 
 /// True when the user pressed Deny in KDE's input capture dialog, which must not be re-asked unprompted.
