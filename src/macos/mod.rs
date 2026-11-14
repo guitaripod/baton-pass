@@ -26,6 +26,7 @@ const EXIT_RESEND: Duration = Duration::from_millis(30);
 const PUSH_MEMORY: Duration = Duration::from_millis(60);
 const CALIBRATION_COUNTS: i8 = 120;
 const CALIBRATION_REPORTS: i32 = 2;
+const CALIBRATION_SETTLE: Duration = Duration::from_millis(50);
 const RATIO_SAMPLES: usize = 7;
 const RATIO_SHIFT: f64 = 0.12;
 const NUDGE_SETTLE: Duration = Duration::from_millis(20);
@@ -34,6 +35,16 @@ const LATE_TICK: Duration = Duration::from_millis(150);
 const PARKING_LIMIT: Duration = Duration::from_millis(500);
 const CHALLENGE_LIFETIME: Duration = Duration::from_secs(5);
 const EXIT_ARM_DISTANCE: f64 = 24.0;
+
+/// A calibration in progress. It advances one step per tick, so the receive loop keeps
+/// answering while the cursor makes its out-and-back moves.
+struct Calibration {
+    direction: i8,
+    from: Option<Point>,
+    outward: bool,
+    samples: Vec<f64>,
+    next_at: Instant,
+}
 
 /// Counts posted since `start` was read, for re-measuring the count-to-point ratio during use.
 struct Window {
@@ -78,6 +89,7 @@ struct Receiver {
     last_calibration: Option<Instant>,
     pointer_was_ready: bool,
     recalibrate: bool,
+    calibration: Option<Calibration>,
     window: Option<Window>,
     ratio_samples: Vec<f64>,
     last_nudge: Option<Instant>,
@@ -125,6 +137,7 @@ pub async fn run(config: Config) -> Result<()> {
         last_calibration: None,
         pointer_was_ready: false,
         recalibrate: false,
+        calibration: None,
         window: None,
         ratio_samples: Vec::new(),
         last_nudge: None,
@@ -288,8 +301,9 @@ impl Receiver {
         self.wheel = (0, 0);
         self.pushed = None;
         self.refresh_displays(true);
+        self.abort_calibration();
         if self.points_per_count.is_none() {
-            self.calibrate().await;
+            self.calibrate_now().await;
         }
         self.window = None;
         if frac.is_finite() {
@@ -520,9 +534,13 @@ impl Receiver {
             self.last_calibration = None;
         }
         if !self.entered {
+            if self.calibration.as_ref().is_some_and(|calibration| Instant::now() >= calibration.next_at) {
+                self.step_calibration();
+                return;
+            }
             let due = self.last_calibration.is_none_or(|at| at.elapsed() > Duration::from_secs(30));
-            if (self.points_per_count.is_none() || self.recalibrate) && due && ready {
-                self.calibrate().await;
+            if self.calibration.is_none() && (self.points_per_count.is_none() || self.recalibrate) && due && ready {
+                self.begin_calibration().await;
             }
             return;
         }
@@ -582,9 +600,19 @@ impl Receiver {
         })
     }
 
-    /// Measures how many points the cursor travels per virtual-mouse count with a short
-    /// out-and-back move toward the middle of its display.
-    async fn calibrate(&mut self) {
+    /// Measures how many points the cursor travels per virtual-mouse count, right away: only
+    /// for an entry that arrives before any calibration has finished.
+    async fn calibrate_now(&mut self) {
+        self.begin_calibration().await;
+        while let Some(next_at) = self.calibration.as_ref().map(|calibration| next_at_tokio(calibration.next_at)) {
+            tokio::time::sleep_until(next_at).await;
+            self.step_calibration();
+        }
+    }
+
+    /// Starts measuring the count-to-point ratio with two short out-and-back moves toward the
+    /// middle of the cursor's display; `step_calibration` carries it on from later ticks.
+    async fn begin_calibration(&mut self) {
         self.last_calibration = Some(Instant::now());
         if !vhid::pointing_ready() {
             return;
@@ -601,27 +629,44 @@ impl Receiver {
             return;
         };
         let direction: i8 = if start.x < area.center().x { 1 } else { -1 };
-        let mut samples = Vec::with_capacity(2);
+        post_calibration_move(direction);
+        self.calibration = Some(Calibration {
+            direction,
+            from: Some(start),
+            outward: true,
+            samples: Vec::with_capacity(2),
+            next_at: Instant::now() + CALIBRATION_SETTLE,
+        });
+    }
+
+    /// Reads where an outward move landed and brings the cursor back, or starts the next move,
+    /// or, with both samples in, settles the ratio.
+    fn step_calibration(&mut self) {
+        let Some(mut calibration) = self.calibration.take() else { return };
         let counts = (CALIBRATION_COUNTS as i32 * CALIBRATION_REPORTS) as f64;
-        for _ in 0..2 {
-            let Some(from) = display::cursor() else { return };
-            for _ in 0..CALIBRATION_REPORTS {
-                vhid::pointing(0, direction * CALIBRATION_COUNTS, 0, 0, 0);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        if calibration.outward {
             let reached = display::cursor();
-            for _ in 0..CALIBRATION_REPORTS {
-                vhid::pointing(0, -direction * CALIBRATION_COUNTS, 0, 0, 0);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let Some(reached) = reached else { return };
+            post_calibration_move(-calibration.direction);
+            calibration.outward = false;
+            let (Some(from), Some(reached)) = (calibration.from, reached) else { return };
             if (reached.y - from.y).abs() > 1.0 {
                 tracing::info!("calibration disturbed by other pointer movement; retrying later");
                 return;
             }
-            samples.push((reached.x - from.x) * direction as f64 / counts);
+            calibration.samples.push((reached.x - from.x) * calibration.direction as f64 / counts);
+            calibration.next_at = Instant::now() + CALIBRATION_SETTLE;
+            self.calibration = Some(calibration);
+            return;
         }
-        let (first, second) = (samples[0], samples[1]);
+        if calibration.samples.len() < 2 {
+            calibration.from = display::cursor();
+            post_calibration_move(calibration.direction);
+            calibration.outward = true;
+            calibration.next_at = Instant::now() + CALIBRATION_SETTLE;
+            self.calibration = Some(calibration);
+            return;
+        }
+        let (first, second) = (calibration.samples[0], calibration.samples[1]);
         if first <= 0.02 || second <= 0.02 || (first - second).abs() > 0.05 * first.max(second) {
             tracing::info!("calibration samples disagree ({first:.3}, {second:.3}); retrying later");
             return;
@@ -632,6 +677,25 @@ impl Receiver {
         self.ratio_samples.clear();
         self.recalibrate = false;
     }
+
+    /// Stops a calibration when the desktop takes control, undoing a move still out.
+    fn abort_calibration(&mut self) {
+        if let Some(calibration) = self.calibration.take()
+            && calibration.outward
+        {
+            post_calibration_move(-calibration.direction);
+        }
+    }
+}
+
+fn post_calibration_move(direction: i8) {
+    for _ in 0..CALIBRATION_REPORTS {
+        vhid::pointing(0, direction * CALIBRATION_COUNTS, 0, 0, 0);
+    }
+}
+
+fn next_at_tokio(at: Instant) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(at)
 }
 
 /// Logs a handler that held the event loop long enough to delay input and replies.
