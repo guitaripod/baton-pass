@@ -50,7 +50,7 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
         }
         link.maintain().await;
         if let Ok(Ok((length, from))) = tokio::time::timeout(Duration::from_millis(50), link.recv(&mut buffer)).await {
-            link.accept(&buffer[..length], from);
+            link.accept(&buffer[..length], from).await;
         }
     }
     println!("linked with {}", link.peer.expect("connected"));
@@ -62,7 +62,7 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
         let reply = tokio::time::timeout(Duration::from_millis(500), async {
             loop {
                 let (length, from) = link.recv(&mut buffer).await?;
-                if let Some(Incoming::Message(Msg::Ack { flags })) = link.accept(&buffer[..length], from) {
+                if let Some(Incoming::Message(Msg::Ack { flags })) = link.accept(&buffer[..length], from).await {
                     return Ok::<u8, std::io::Error>(flags);
                 }
             }
@@ -137,17 +137,24 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
         let cipher = link.cipher();
         let mut counter = crate::crypto::Counter::new();
         let mut frame = |msg: Msg| cipher.seal(&crate::proto::Envelope { token, counter: counter.next(), msg }.encode());
-        let saved = super::clipboard::exchange(&cipher, peer, frame(Msg::ClipGet), token).await?;
-        let put = Msg::ClipPut { mime: "text/plain;charset=utf-8".into(), data: text.clone().into_bytes() };
+        let saved = super::clipboard::exchange(&cipher, peer, frame(Msg::ClipGet { have: [0; 32] }), token).await?;
+        let test = ("text/plain;charset=utf-8".to_string(), text.clone().into_bytes());
+        let put = Msg::ClipPut { mime: test.0.clone(), data: test.1.clone() };
         let started = Instant::now();
         super::clipboard::exchange(&cipher, peer, frame(put), token).await?;
         println!("put {text:?} on the Mac clipboard in {} ms", started.elapsed().as_millis());
-        let again = super::clipboard::exchange(&cipher, peer, frame(Msg::ClipGet), token).await?;
-        println!("asking again returns {}", if matches!(again.msg, Msg::ClipNone) { "nothing (unchanged)" } else { "data" });
-        if let Msg::ClipData { mime, data } = saved.msg {
-            println!("restoring the previous {mime} ({} bytes)", data.len());
-            super::clipboard::exchange(&cipher, peer, frame(Msg::ClipPut { mime, data }), token).await?;
-        }
+        let have = super::clipboard::digest(&test);
+        let again = super::clipboard::exchange(&cipher, peer, frame(Msg::ClipGet { have }), token).await?;
+        println!(
+            "asking again with its digest returns {}",
+            if matches!(again.msg, Msg::ClipNone { .. }) { "nothing (unchanged)" } else { "data" }
+        );
+        let restore = match saved.msg {
+            Msg::ClipData { mime, data, .. } => Msg::ClipPut { mime, data },
+            _ => Msg::ClipPut { mime: test.0, data: Vec::new() },
+        };
+        super::clipboard::exchange(&cipher, peer, frame(restore), token).await?;
+        println!("restored the Mac clipboard");
     }
 
     if cross {
@@ -159,7 +166,7 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
             link.send(Msg::Pointer { dx: 4.0, dy: 0.0, wheel_v: 0, wheel_h: 0, buttons: 0 }).await;
             link.send(Msg::Heartbeat { entered: true, keys: Default::default(), buttons: 0 }).await;
             if let Ok(Ok((length, from))) = tokio::time::timeout(Duration::from_millis(5), link.recv(&mut buffer)).await
-                && let Some(Incoming::Message(Msg::Exit { frac })) = link.accept(&buffer[..length], from) {
+                && let Some(Incoming::Message(Msg::Exit { frac })) = link.accept(&buffer[..length], from).await {
                     exit = Some((frac, started.elapsed()));
                 }
         }

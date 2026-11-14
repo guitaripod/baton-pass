@@ -1,5 +1,6 @@
 use crate::crypto::{Cipher, Counter, random_u64};
 use crate::proto::{Envelope, Msg};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -7,6 +8,7 @@ use tokio::net::UdpSocket;
 
 const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+const NONCE_MEMORY: usize = 4;
 
 /// The encrypted UDP session with the Mac: handshake, replay protection and liveness.
 pub struct Link {
@@ -14,12 +16,14 @@ pub struct Link {
     cipher: Rc<Cipher>,
     peers: Vec<String>,
     counter: Counter,
-    hello_nonce: u64,
+    nonces: VecDeque<u64>,
+    joining: Option<(SocketAddr, u64)>,
     last_hello: Option<Instant>,
     next_peer: usize,
     pub peer: Option<SocketAddr>,
     pub token: Option<u64>,
     peer_counter: u64,
+    session_floor: u64,
     pub last_heard: Instant,
     pub flags: u8,
 }
@@ -37,12 +41,14 @@ impl Link {
             cipher,
             peers,
             counter: Counter::new(),
-            hello_nonce: random_u64(),
+            nonces: VecDeque::new(),
+            joining: None,
             last_hello: None,
             next_peer: 0,
             peer: None,
             token: None,
             peer_counter: 0,
+            session_floor: 0,
             last_heard: Instant::now(),
             flags: 0,
         })
@@ -63,6 +69,8 @@ impl Link {
         self.flags = 0;
         self.next_peer = 0;
         self.last_hello = None;
+        self.nonces.clear();
+        self.joining = None;
     }
 
     /// Greets one configured peer per interval, in order, so the wired address wins whenever it
@@ -75,13 +83,17 @@ impl Link {
             return;
         }
         self.last_hello = Some(Instant::now());
-        self.hello_nonce = random_u64();
         if self.peers.is_empty() {
             return;
         }
+        let nonce = random_u64();
+        if self.nonces.len() == NONCE_MEMORY {
+            self.nonces.pop_front();
+        }
+        self.nonces.push_back(nonce);
         let peer = self.peers[self.next_peer % self.peers.len()].clone();
         self.next_peer = (self.next_peer + 1) % self.peers.len();
-        let packet = self.seal(0, Msg::Hello { nonce: self.hello_nonce });
+        let packet = self.seal(0, Msg::Hello { nonce });
         match tokio::net::lookup_host(&peer).await {
             Ok(mut addresses) => {
                 if let Some(address) = addresses.find(SocketAddr::is_ipv4)
@@ -111,21 +123,40 @@ impl Link {
     }
 
     /// Authenticates a datagram and applies the session rules; returns what the daemon must act on.
-    pub fn accept(&mut self, packet: &[u8], from: SocketAddr) -> Option<Incoming> {
+    /// The handshake is Hello, Challenge, Join, Welcome: the Mac only opens a session for a Join
+    /// that answers its latest single-use challenge, so replayed handshake packets open nothing.
+    pub async fn accept(&mut self, packet: &[u8], from: SocketAddr) -> Option<Incoming> {
         let envelope = Envelope::decode(&self.cipher.open(packet)?)?;
         match envelope.msg {
-            Msg::Welcome { nonce, token } if nonce == self.hello_nonce && !self.connected() => {
+            Msg::Challenge { nonce, challenge } if !self.connected() && self.nonces.contains(&nonce) => {
+                self.joining = Some((from, nonce));
+                let join = self.seal(0, Msg::Join { nonce, challenge });
+                if let Err(error) = self.socket.send_to(&join, from).await {
+                    tracing::debug!("join to {from}: {error}");
+                }
+                None
+            }
+            Msg::Welcome { nonce, token } if !self.connected() && self.joining == Some((from, nonce)) => {
                 self.token = Some(token);
                 self.peer = Some(from);
                 self.peer_counter = envelope.counter;
+                self.session_floor = self.counter.peek();
                 self.last_heard = Instant::now();
+                self.nonces.clear();
+                self.joining = None;
                 tracing::info!("linked with the Mac at {from}");
                 Some(Incoming::Connected)
             }
-            Msg::Reset if Some(from) == self.peer && self.connected() => {
-                self.disconnect("the Mac restarted its session");
+            Msg::Reset { token, counter }
+                if self.connected()
+                    && Some(from) == self.peer
+                    && Some(token) == self.token
+                    && counter >= self.session_floor =>
+            {
+                self.disconnect("the Mac no longer knows this session");
                 None
             }
+            Msg::Challenge { .. } | Msg::Welcome { .. } | Msg::Reset { .. } => None,
             msg => {
                 if Some(envelope.token) != self.token || Some(from) != self.peer {
                     return None;

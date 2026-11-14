@@ -25,6 +25,7 @@ const EXIT_RESEND: Duration = Duration::from_millis(30);
 const PUSH_MEMORY: Duration = Duration::from_millis(60);
 const CALIBRATION_COUNTS: i8 = 60;
 const PARKING_LIMIT: Duration = Duration::from_millis(500);
+const CHALLENGE_LIFETIME: Duration = Duration::from_secs(5);
 
 /// Counts posted since `start` was read, for re-measuring the count-to-point ratio during use.
 struct Window {
@@ -39,7 +40,7 @@ struct Gate {
     peer: Option<SocketAddr>,
     tcp_counter: u64,
     counter: Counter,
-    synced: Option<[u8; 32]>,
+    clipboard_busy: bool,
 }
 
 struct Receiver {
@@ -50,6 +51,7 @@ struct Receiver {
     udp_counter: u64,
     last_heard: Instant,
     last_reset: Instant,
+    challenge: Option<(u64, SocketAddr, Instant)>,
     entered: bool,
     exiting: Option<(f32, Instant)>,
     exit_side: Side,
@@ -62,6 +64,7 @@ struct Receiver {
     points_per_count: Option<f64>,
     last_calibration: Option<Instant>,
     pointer_was_ready: bool,
+    recalibrate: bool,
     window: Option<Window>,
     parking: Option<(Point, Instant)>,
     displays: Vec<Rect>,
@@ -78,7 +81,7 @@ pub async fn run(config: Config) -> Result<()> {
         peer: None,
         tcp_counter: 0,
         counter: Counter::new(),
-        synced: None,
+        clipboard_busy: false,
     }));
     let mut receiver = Receiver {
         socket,
@@ -88,6 +91,7 @@ pub async fn run(config: Config) -> Result<()> {
         udp_counter: 0,
         last_heard: Instant::now(),
         last_reset: Instant::now() - Duration::from_secs(1),
+        challenge: None,
         entered: false,
         exiting: None,
         exit_side: Side::Right,
@@ -100,6 +104,7 @@ pub async fn run(config: Config) -> Result<()> {
         points_per_count: None,
         last_calibration: None,
         pointer_was_ready: false,
+        recalibrate: false,
         window: None,
         parking: None,
         displays: Vec::new(),
@@ -121,8 +126,10 @@ pub async fn run(config: Config) -> Result<()> {
             },
             accepted = listener.accept() => match accepted {
                 Ok((stream, from)) => {
-                    let allowed = gate.borrow().peer.map(|peer| peer.ip()) == Some(from.ip());
+                    let mut state = gate.borrow_mut();
+                    let allowed = state.peer.map(|peer| peer.ip()) == Some(from.ip()) && !state.clipboard_busy;
                     if allowed {
+                        state.clipboard_busy = true;
                         tokio::task::spawn_local(serve_clipboard(stream, cipher.clone(), gate.clone()));
                     }
                 }
@@ -153,29 +160,45 @@ impl Receiver {
         let Some(envelope) = self.cipher.open(packet).and_then(|plain| Envelope::decode(&plain)) else {
             return;
         };
-        if let Msg::Hello { nonce } = envelope.msg {
-            let token = random_u64();
-            {
-                let mut gate = self.gate.borrow_mut();
-                gate.token = Some(token);
-                gate.peer = Some(from);
-                gate.tcp_counter = 0;
+        match envelope.msg {
+            Msg::Hello { nonce } => {
+                let challenge = random_u64();
+                self.challenge = Some((challenge, from, Instant::now()));
+                self.reply(from, 0, Msg::Challenge { nonce, challenge }).await;
+                return;
             }
-            self.udp_counter = envelope.counter;
-            self.last_heard = Instant::now();
-            self.leave("new session");
-            tracing::info!("session with {from}");
-            self.reply(from, 0, Msg::Welcome { nonce, token }).await;
-            return;
+            Msg::Join { nonce, challenge } => {
+                let answered = self.challenge.is_some_and(|(issued, to, at)| {
+                    issued == challenge && to == from && at.elapsed() < CHALLENGE_LIFETIME
+                });
+                if !answered {
+                    return;
+                }
+                self.challenge = None;
+                let token = random_u64();
+                {
+                    let mut gate = self.gate.borrow_mut();
+                    gate.token = Some(token);
+                    gate.peer = Some(from);
+                    gate.tcp_counter = 0;
+                }
+                self.udp_counter = envelope.counter;
+                self.last_heard = Instant::now();
+                self.leave("new session");
+                tracing::info!("session with {from}");
+                self.reply(from, 0, Msg::Welcome { nonce, token }).await;
+                return;
+            }
+            _ => {}
         }
         let (token, peer) = {
             let gate = self.gate.borrow();
             (gate.token, gate.peer)
         };
         if Some(envelope.token) != token || Some(from) != peer {
-            if self.last_reset.elapsed() > Duration::from_millis(200) {
+            if envelope.token != 0 && self.last_reset.elapsed() > Duration::from_millis(200) {
                 self.last_reset = Instant::now();
-                self.reply(from, 0, Msg::Reset).await;
+                self.reply(from, 0, Msg::Reset { token: envelope.token, counter: envelope.counter }).await;
             }
             return;
         }
@@ -351,13 +374,18 @@ impl Receiver {
     /// Warping is avoided on purpose: macOS drops hardware mouse input for a quarter second after one.
     fn nudge_to(&self, target: Point) -> bool {
         let (Some(ratio), Some(now)) = (self.points_per_count, display::cursor()) else { return true };
-        let (dx, dy) = (target.x - now.x, target.y - now.y);
-        if dx.abs() < 1.0 && dy.abs() < 1.0 {
+        let (mut x, mut y) = (((target.x - now.x) / ratio).round() as i32, ((target.y - now.y) / ratio).round() as i32);
+        if x == 0 && y == 0 {
             return true;
         }
-        let (mut x, mut y) = ((dx / ratio).round() as i32, (dy / ratio).round() as i32);
         post_motion(self.buttons, &mut x, &mut y, &mut 0, &mut 0);
         false
+    }
+
+    /// How far inside an edge the cursor is placed: two points, plus one count's worth of travel
+    /// so a rounded move can never land it on the edge itself.
+    fn inset(&self) -> f64 {
+        2.0 + self.points_per_count.unwrap_or(1.0)
     }
 
     async fn move_to(&self, target: Point) {
@@ -404,12 +432,12 @@ impl Receiver {
         let ready = vhid::pointing_ready();
         if ready != self.pointer_was_ready {
             self.pointer_was_ready = ready;
-            self.points_per_count = None;
+            self.recalibrate = true;
             self.last_calibration = None;
         }
         if !self.entered {
             let due = self.last_calibration.is_none_or(|at| at.elapsed() > Duration::from_secs(30));
-            if self.points_per_count.is_none() && due && ready {
+            if (self.points_per_count.is_none() || self.recalibrate) && due && ready {
                 self.calibrate().await;
             }
             return;
@@ -421,7 +449,7 @@ impl Receiver {
         let Some(cursor) = display::cursor() else { return };
         self.learn_ratio(cursor);
         let pushing = self.pushed.filter(|(_, _, at)| at.elapsed() < PUSH_MEMORY).map(|(dx, dy, _)| (dx, dy));
-        match edge_decision(&self.displays, self.exit_side, cursor, pushing) {
+        match edge_decision(&self.displays, self.exit_side, cursor, pushing, self.inset()) {
             EdgeDecision::Stay => {}
             EdgeDecision::Exit { frac, park } => {
                 vhid::pointing(0, 0, 0, 0, 0);
@@ -453,11 +481,12 @@ impl Receiver {
     fn entry_point(&self, frac: f32) -> Option<Point> {
         let rect = edge_rect(&self.displays, self.exit_side, None)?;
         let frac = frac.clamp(0.0, 1.0) as f64;
+        let inset = self.inset();
         Some(match self.exit_side {
-            Side::Right => Point { x: rect.max_x() - 2.0, y: rect.min_y() + frac * (rect.size.y - 1.0) },
-            Side::Left => Point { x: rect.min_x() + 1.0, y: rect.min_y() + frac * (rect.size.y - 1.0) },
-            Side::Bottom => Point { x: rect.min_x() + frac * (rect.size.x - 1.0), y: rect.max_y() - 2.0 },
-            Side::Top => Point { x: rect.min_x() + frac * (rect.size.x - 1.0), y: rect.min_y() + 1.0 },
+            Side::Right => Point { x: rect.max_x() - inset, y: rect.min_y() + frac * (rect.size.y - 1.0) },
+            Side::Left => Point { x: rect.min_x() + inset, y: rect.min_y() + frac * (rect.size.y - 1.0) },
+            Side::Bottom => Point { x: rect.min_x() + frac * (rect.size.x - 1.0), y: rect.max_y() - inset },
+            Side::Top => Point { x: rect.min_x() + frac * (rect.size.x - 1.0), y: rect.min_y() + inset },
         })
     }
 
@@ -480,18 +509,30 @@ impl Receiver {
             return;
         };
         let direction: i8 = if start.x < area.center().x { 1 } else { -1 };
-        vhid::pointing(0, direction * CALIBRATION_COUNTS, 0, 0, 0);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let moved = display::cursor().map(|now| (now.x - start.x) * direction as f64);
-        vhid::pointing(0, -direction * CALIBRATION_COUNTS, 0, 0, 0);
-        match moved {
-            Some(moved) if moved > 1.0 => {
-                let ratio = moved / CALIBRATION_COUNTS as f64;
-                tracing::info!("virtual mouse moves {ratio:.3} points per count");
-                self.points_per_count = Some(ratio);
+        let mut samples = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let Some(from) = display::cursor() else { return };
+            vhid::pointing(0, direction * CALIBRATION_COUNTS, 0, 0, 0);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let reached = display::cursor();
+            vhid::pointing(0, -direction * CALIBRATION_COUNTS, 0, 0, 0);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let Some(reached) = reached else { return };
+            if (reached.y - from.y).abs() > 1.0 {
+                tracing::info!("calibration disturbed by other pointer movement; retrying later");
+                return;
             }
-            other => tracing::warn!("calibration saw no movement ({other:?}); retrying later"),
+            samples.push((reached.x - from.x) * direction as f64 / CALIBRATION_COUNTS as f64);
         }
+        let (first, second) = (samples[0], samples[1]);
+        if first <= 0.02 || second <= 0.02 || (first - second).abs() > 0.05 * first.max(second) {
+            tracing::info!("calibration samples disagree ({first:.3}, {second:.3}); retrying later");
+            return;
+        }
+        let ratio = (first + second) / 2.0;
+        tracing::info!("virtual mouse moves {ratio:.3} points per count");
+        self.points_per_count = Some(ratio);
+        self.recalibrate = false;
     }
 }
 
@@ -548,7 +589,7 @@ fn edge_rect(displays: &[Rect], side: Side, along: Option<f64>) -> Option<Rect> 
 
 /// Decides whether the cursor has left through the exit edge, wandered off the allowed displays
 /// (and must be pulled back), or is fine where it is.
-fn edge_decision(displays: &[Rect], exit: Side, cursor: Point, pushing: Option<(f32, f32)>) -> EdgeDecision {
+fn edge_decision(displays: &[Rect], exit: Side, cursor: Point, pushing: Option<(f32, f32)>, inset: f64) -> EdgeDecision {
     if displays.is_empty() {
         return EdgeDecision::Stay;
     }
@@ -564,10 +605,10 @@ fn edge_decision(displays: &[Rect], exit: Side, cursor: Point, pushing: Option<(
         Side::Top => dy < 0.0,
     });
     let beyond = match exit {
-        Side::Right => cursor.x >= edge.max_x() - 0.5 || (pushing_out && cursor.x >= edge.max_x() - 1.5),
-        Side::Left => cursor.x < edge.min_x() + 0.5 || (pushing_out && cursor.x < edge.min_x() + 1.5),
-        Side::Bottom => cursor.y >= edge.max_y() - 0.5 || (pushing_out && cursor.y >= edge.max_y() - 1.5),
-        Side::Top => cursor.y < edge.min_y() + 0.5 || (pushing_out && cursor.y < edge.min_y() + 1.5),
+        Side::Right => cursor.x >= edge.max_x() || (pushing_out && cursor.x >= edge.max_x() - 1.5),
+        Side::Left => cursor.x < edge.min_x() || (pushing_out && cursor.x < edge.min_x() + 1.5),
+        Side::Bottom => cursor.y >= edge.max_y() || (pushing_out && cursor.y >= edge.max_y() - 1.5),
+        Side::Top => cursor.y < edge.min_y() || (pushing_out && cursor.y < edge.min_y() + 1.5),
     };
     let (start, length) = match exit {
         Side::Left | Side::Right => (edge.min_y(), edge.size.y),
@@ -578,13 +619,13 @@ fn edge_decision(displays: &[Rect], exit: Side, cursor: Point, pushing: Option<(
         let frac = ((along - start) / (length - 1.0).max(1.0)).clamp(0.0, 1.0) as f32;
         let park = edge.clamp(Point {
             x: match exit {
-                Side::Right => edge.max_x() - 2.0,
-                Side::Left => edge.min_x() + 1.0,
+                Side::Right => edge.max_x() - inset,
+                Side::Left => edge.min_x() + inset,
                 _ => cursor.x,
             },
             y: match exit {
-                Side::Bottom => edge.max_y() - 2.0,
-                Side::Top => edge.min_y() + 1.0,
+                Side::Bottom => edge.max_y() - inset,
+                Side::Top => edge.min_y() + inset,
                 _ => cursor.y,
             },
         });
@@ -608,30 +649,29 @@ async fn serve_clipboard(mut stream: TcpStream, cipher: Rc<Cipher>, gate: Rc<Ref
             .open(&request)
             .and_then(|plain| Envelope::decode(&plain))
             .context("unauthenticated clipboard request")?;
-        let token = {
+        if !matches!(envelope.msg, Msg::ClipPut { .. } | Msg::ClipGet { .. }) {
+            bail!("unexpected clipboard request");
+        }
+        {
             let mut gate = gate.borrow_mut();
             if Some(envelope.token) != gate.token || envelope.counter <= gate.tcp_counter {
                 bail!("stale clipboard request");
             }
             gate.tcp_counter = envelope.counter;
-            envelope.token
-        };
+        }
+        let (token, echo) = (envelope.token, envelope.counter);
         let reply = match envelope.msg {
             Msg::ClipPut { mime, data } => {
                 let content = (mime, data);
                 pasteboard::write(&content).await?;
-                gate.borrow_mut().synced = Some(digest(&content));
                 tracing::info!("clipboard to the Mac: {} ({} bytes)", content.0, content.1.len());
-                Msg::ClipNone
+                Msg::ClipNone { echo }
             }
-            Msg::ClipGet => match pasteboard::read().await? {
-                Some(content) if gate.borrow().synced != Some(digest(&content)) => {
-                    gate.borrow_mut().synced = Some(digest(&content));
-                    Msg::ClipData { mime: content.0, data: content.1 }
-                }
-                _ => Msg::ClipNone,
+            Msg::ClipGet { have } => match pasteboard::read().await? {
+                Some(content) if digest(&content) != have => Msg::ClipData { echo, mime: content.0, data: content.1 },
+                _ => Msg::ClipNone { echo },
             },
-            _ => bail!("unexpected clipboard request"),
+            _ => unreachable!("checked above"),
         };
         let counter = gate.borrow_mut().counter.next();
         let frame = cipher.seal(&Envelope { token, counter, msg: reply }.encode());
@@ -640,6 +680,7 @@ async fn serve_clipboard(mut stream: TcpStream, cipher: Rc<Cipher>, gate: Rc<Ref
         Ok(())
     }
     .await;
+    gate.borrow_mut().clipboard_busy = false;
     if let Err(error) = result {
         tracing::warn!("clipboard: {error:#}");
     }
@@ -676,7 +717,7 @@ mod tests {
     #[test]
     fn crossing_onto_a_display_beyond_exits() {
         let builtin = [rect(0.0, 0.0, 1512.0, 982.0)];
-        let decision = edge_decision(&builtin, Side::Right, Point { x: 1520.0, y: 491.0 }, Some((3.0, 0.0)));
+        let decision = edge_decision(&builtin, Side::Right, Point { x: 1520.0, y: 491.0 }, Some((3.0, 0.0)), 2.0);
         match decision {
             EdgeDecision::Exit { frac, park } => {
                 assert!((frac - 0.5).abs() < 0.01);
@@ -690,25 +731,42 @@ mod tests {
     fn pushing_against_a_bare_edge_exits() {
         let builtin = [rect(0.0, 0.0, 1512.0, 982.0)];
         let pinned = Point { x: 1511.0, y: 100.0 };
-        assert!(matches!(edge_decision(&builtin, Side::Right, pinned, Some((2.0, 0.0))), EdgeDecision::Exit { .. }));
-        assert_eq!(edge_decision(&builtin, Side::Right, pinned, Some((-2.0, 0.0))), EdgeDecision::Stay);
-        assert_eq!(edge_decision(&builtin, Side::Right, pinned, None), EdgeDecision::Stay);
+        assert!(matches!(edge_decision(&builtin, Side::Right, pinned, Some((2.0, 0.0)), 2.0), EdgeDecision::Exit { .. }));
+        assert_eq!(edge_decision(&builtin, Side::Right, pinned, Some((-2.0, 0.0)), 2.0), EdgeDecision::Stay);
+        assert_eq!(edge_decision(&builtin, Side::Right, pinned, None, 2.0), EdgeDecision::Stay);
     }
 
     #[test]
     fn wandering_onto_a_hidden_display_is_pulled_back() {
         let builtin = [rect(0.0, 0.0, 1512.0, 982.0)];
-        let decision = edge_decision(&builtin, Side::Right, Point { x: -40.0, y: 300.0 }, Some((-5.0, 0.0)));
+        let decision = edge_decision(&builtin, Side::Right, Point { x: -40.0, y: 300.0 }, Some((-5.0, 0.0)), 2.0);
         assert_eq!(decision, EdgeDecision::Clamp(Point { x: 0.0, y: 300.0 }));
     }
 
     #[test]
     fn exit_uses_the_outermost_display() {
         let displays = [rect(0.0, 0.0, 1512.0, 982.0), rect(1512.0, 0.0, 1920.0, 1080.0)];
-        assert_eq!(edge_decision(&displays, Side::Right, Point { x: 1600.0, y: 10.0 }, Some((1.0, 0.0))), EdgeDecision::Stay);
+        assert_eq!(edge_decision(&displays, Side::Right, Point { x: 1600.0, y: 10.0 }, Some((1.0, 0.0)), 2.0), EdgeDecision::Stay);
         assert!(matches!(
-            edge_decision(&displays, Side::Right, Point { x: 3432.0, y: 10.0 }, Some((1.0, 0.0))),
+            edge_decision(&displays, Side::Right, Point { x: 3432.0, y: 10.0 }, Some((1.0, 0.0)), 2.0),
             EdgeDecision::Exit { .. }
         ));
+    }
+
+    #[test]
+    fn left_and_right_edges_behave_alike() {
+        let builtin = [rect(0.0, 0.0, 1512.0, 982.0)];
+        let left_pinned = Point { x: 0.0, y: 100.0 };
+        assert_eq!(edge_decision(&builtin, Side::Left, left_pinned, None, 2.0), EdgeDecision::Stay);
+        assert!(matches!(
+            edge_decision(&builtin, Side::Left, left_pinned, Some((-2.0, 0.0)), 2.0),
+            EdgeDecision::Exit { .. }
+        ));
+        assert!(matches!(
+            edge_decision(&builtin, Side::Left, Point { x: -10.0, y: 100.0 }, None, 2.0),
+            EdgeDecision::Exit { .. }
+        ));
+        let top_pinned = Point { x: 700.0, y: 0.0 };
+        assert_eq!(edge_decision(&builtin, Side::Top, top_pinned, None, 2.0), EdgeDecision::Stay);
     }
 }

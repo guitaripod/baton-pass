@@ -19,6 +19,10 @@ pub async fn install(peers: Vec<String>) -> Result<()> {
         }
         write(&config_path, &default_config(&peers))?;
         println!("wrote {}", config_path.display());
+    } else if !peers.is_empty() {
+        let existing = std::fs::read_to_string(&config_path)?;
+        write(&config_path, &with_peers(&existing, &peers))?;
+        println!("set peers in {}", config_path.display());
     }
     let config = Config::load()?;
     let hotkey = Hotkey::parse(&config.hotkey)?;
@@ -86,11 +90,37 @@ async fn load_kwin_script(main_script: &Path) -> Result<()> {
     Ok(())
 }
 
+fn peers_line(peers: &[String]) -> String {
+    format!("peers = [{}]", peers.iter().map(|peer| format!("{peer:?}")).collect::<Vec<_>>().join(", "))
+}
+
+/// Replaces the `peers` line of an existing config, keeping everything else as the user wrote it.
+fn with_peers(config: &str, peers: &[String]) -> String {
+    let line = peers_line(peers);
+    let mut replaced = false;
+    let mut lines: Vec<String> = config
+        .lines()
+        .map(|existing| {
+            let key = existing.trim_start();
+            if !replaced && (key.starts_with("peers ") || key.starts_with("peers=")) {
+                replaced = true;
+                line.clone()
+            } else {
+                existing.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.insert(0, line);
+    }
+    lines.join("\n") + "\n"
+}
+
 fn default_config(peers: &[String]) -> String {
-    let peers = peers.iter().map(|peer| format!("{peer:?}")).collect::<Vec<_>>().join(", ");
+    let peers = peers_line(peers);
     format!(
         r#"# The Mac, tried in order until one answers. Put the wired LAN address first.
-peers = [{peers}]
+{peers}
 # Which edge of this desktop the Mac sits beyond: left, right, top or bottom.
 side = "left"
 # Here it sends the mouse and keyboard to the Mac; on the Mac it brings them back.
@@ -136,6 +166,7 @@ const METADATA: &str = r#"{
 "#;
 
 fn kwin_script(shortcut: &str) -> String {
+    let shortcut = shortcut.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
         r#"registerShortcut("FerryToggle", "Ferry: Carry Mouse and Keyboard to the Mac", "{shortcut}", function () {{
     const position = workspace.cursorPos;
@@ -143,4 +174,22 @@ fn kwin_script(shortcut: &str) -> String {
 }});
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peers_line_is_replaced_in_place() {
+        let config = "# comment\npeers = [\"10.0.0.1\"]\nside = \"left\"\n";
+        let updated = with_peers(config, &["10.0.0.2".into(), "mac".into()]);
+        assert_eq!(updated, "# comment\npeers = [\"10.0.0.2\", \"mac\"]\nside = \"left\"\n");
+        assert!(with_peers("side = \"left\"\n", &["a".into()]).starts_with("peers = [\"a\"]\n"));
+    }
+
+    #[test]
+    fn shortcut_is_escaped_for_javascript() {
+        assert!(kwin_script("Meta+\\").contains("\"Meta+\\\\\""));
+    }
 }

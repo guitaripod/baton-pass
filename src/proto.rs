@@ -19,8 +19,10 @@ pub struct KeyState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     Hello { nonce: u64 },
+    Challenge { nonce: u64, challenge: u64 },
+    Join { nonce: u64, challenge: u64 },
     Welcome { nonce: u64, token: u64 },
-    Reset,
+    Reset { token: u64, counter: u64 },
     Heartbeat { entered: bool, keys: KeyState, buttons: u32 },
     Ack { flags: u8 },
     Enter { side: u8, frac: f32, speed: f32 },
@@ -29,9 +31,9 @@ pub enum Msg {
     Keys(KeyState),
     Exit { frac: f32 },
     ClipPut { mime: String, data: Vec<u8> },
-    ClipGet,
-    ClipData { mime: String, data: Vec<u8> },
-    ClipNone,
+    ClipGet { have: [u8; 32] },
+    ClipData { echo: u64, mime: String, data: Vec<u8> },
+    ClipNone { echo: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,7 +58,11 @@ impl Envelope {
                 out.extend_from_slice(&nonce.to_le_bytes());
                 out.extend_from_slice(&token.to_le_bytes());
             }
-            Msg::Reset => out.push(2),
+            Msg::Reset { token, counter } => {
+                out.push(2);
+                out.extend_from_slice(&token.to_le_bytes());
+                out.extend_from_slice(&counter.to_le_bytes());
+            }
             Msg::Heartbeat { entered, keys, buttons } => {
                 out.push(3);
                 out.push(u8::from(*entered));
@@ -95,13 +101,30 @@ impl Envelope {
                 put_blob(&mut out, mime.as_bytes());
                 put_blob(&mut out, data);
             }
-            Msg::ClipGet => out.push(11),
-            Msg::ClipData { mime, data } => {
+            Msg::ClipGet { have } => {
+                out.push(11);
+                out.extend_from_slice(have);
+            }
+            Msg::ClipData { echo, mime, data } => {
                 out.push(12);
+                out.extend_from_slice(&echo.to_le_bytes());
                 put_blob(&mut out, mime.as_bytes());
                 put_blob(&mut out, data);
             }
-            Msg::ClipNone => out.push(13),
+            Msg::ClipNone { echo } => {
+                out.push(13);
+                out.extend_from_slice(&echo.to_le_bytes());
+            }
+            Msg::Challenge { nonce, challenge } => {
+                out.push(14);
+                out.extend_from_slice(&nonce.to_le_bytes());
+                out.extend_from_slice(&challenge.to_le_bytes());
+            }
+            Msg::Join { nonce, challenge } => {
+                out.push(15);
+                out.extend_from_slice(&nonce.to_le_bytes());
+                out.extend_from_slice(&challenge.to_le_bytes());
+            }
         }
         out
     }
@@ -113,7 +136,7 @@ impl Envelope {
         let msg = match reader.u8()? {
             0 => Msg::Hello { nonce: reader.u64()? },
             1 => Msg::Welcome { nonce: reader.u64()?, token: reader.u64()? },
-            2 => Msg::Reset,
+            2 => Msg::Reset { token: reader.u64()?, counter: reader.u64()? },
             3 => Msg::Heartbeat {
                 entered: reader.u8()? != 0,
                 keys: reader.keys()?,
@@ -132,9 +155,11 @@ impl Envelope {
             8 => Msg::Keys(reader.keys()?),
             9 => Msg::Exit { frac: reader.f32()? },
             10 => Msg::ClipPut { mime: reader.text()?, data: reader.blob()? },
-            11 => Msg::ClipGet,
-            12 => Msg::ClipData { mime: reader.text()?, data: reader.blob()? },
-            13 => Msg::ClipNone,
+            11 => Msg::ClipGet { have: reader.take(32)?.try_into().ok()? },
+            12 => Msg::ClipData { echo: reader.u64()?, mime: reader.text()?, data: reader.blob()? },
+            13 => Msg::ClipNone { echo: reader.u64()? },
+            14 => Msg::Challenge { nonce: reader.u64()?, challenge: reader.u64()? },
+            15 => Msg::Join { nonce: reader.u64()?, challenge: reader.u64()? },
             _ => return None,
         };
         reader.0.is_empty().then_some(Self { token, counter, msg })
@@ -232,7 +257,9 @@ mod tests {
         let keys = KeyState { modifiers: 0x09, keys: vec![4, 5, 0x29], consumer: vec![0xe9] };
         round_trip(Msg::Hello { nonce: 7 });
         round_trip(Msg::Welcome { nonce: 7, token: 9 });
-        round_trip(Msg::Reset);
+        round_trip(Msg::Challenge { nonce: 7, challenge: 11 });
+        round_trip(Msg::Join { nonce: 7, challenge: 11 });
+        round_trip(Msg::Reset { token: 9, counter: 12 });
         round_trip(Msg::Heartbeat { entered: true, keys: keys.clone(), buttons: 5 });
         round_trip(Msg::Ack { flags: FLAG_ENTERED | FLAG_POINTING_READY });
         round_trip(Msg::Enter { side: 0, frac: 0.25, speed: 1.5 });
@@ -241,9 +268,9 @@ mod tests {
         round_trip(Msg::Keys(keys));
         round_trip(Msg::Exit { frac: 0.5 });
         round_trip(Msg::ClipPut { mime: "text/plain;charset=utf-8".into(), data: "hej".into() });
-        round_trip(Msg::ClipGet);
-        round_trip(Msg::ClipData { mime: "image/png".into(), data: vec![1, 2, 3] });
-        round_trip(Msg::ClipNone);
+        round_trip(Msg::ClipGet { have: [5; 32] });
+        round_trip(Msg::ClipData { echo: 3, mime: "image/png".into(), data: vec![1, 2, 3] });
+        round_trip(Msg::ClipNone { echo: 3 });
     }
 
     #[test]

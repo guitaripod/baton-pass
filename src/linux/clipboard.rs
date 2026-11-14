@@ -42,7 +42,19 @@ pub async fn read() -> Result<Option<Content>> {
     if data.is_empty() || data.len() > MAX_CLIPBOARD {
         return Ok(None);
     }
+    let data = if mime == TEXT { utf8_text(&offered, data) } else { data };
     Ok(Some((mime.to_string(), data)))
+}
+
+/// X11's STRING target is Latin-1; everything sent on is UTF-8.
+fn utf8_text(offered: &str, data: Vec<u8>) -> Vec<u8> {
+    if offered == "STRING" {
+        return data.iter().map(|byte| char::from(*byte)).collect::<String>().into_bytes();
+    }
+    match String::from_utf8(data) {
+        Ok(text) => text.into_bytes(),
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned().into_bytes(),
+    }
 }
 
 async fn run_wl_paste(args: &[&str]) -> Result<Option<Vec<u8>>> {
@@ -62,12 +74,17 @@ pub async fn write(content: &Content) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("running wl-copy")?;
     let mut stdin = child.stdin.take().expect("piped stdin");
-    stdin.write_all(&content.1).await?;
-    drop(stdin);
-    let output = tokio::time::timeout(TIMEOUT, child.wait_with_output()).await.context("wl-copy timed out")??;
+    let output = tokio::time::timeout(TIMEOUT, async {
+        stdin.write_all(&content.1).await?;
+        drop(stdin);
+        child.wait_with_output().await
+    })
+    .await
+    .context("wl-copy timed out")??;
     if !output.status.success() {
         bail!("wl-copy failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -100,4 +117,16 @@ pub async fn exchange(cipher: &Cipher, peer: SocketAddr, frame: Vec<u8>, token: 
     })
     .await
     .context("clipboard exchange timed out")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latin1_strings_become_utf8() {
+        assert_eq!(utf8_text("STRING", vec![0x68, 0xe9]), "hé".as_bytes());
+        assert_eq!(utf8_text("UTF8_STRING", "hé".as_bytes().to_vec()), "hé".as_bytes());
+        assert_eq!(utf8_text("TEXT", vec![0x68, 0xff]), "h\u{fffd}".as_bytes());
+    }
 }

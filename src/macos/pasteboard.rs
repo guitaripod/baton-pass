@@ -60,19 +60,24 @@ pub fn helper_set(mime: &str) -> Result<()> {
     if data.len() > MAX_CLIPBOARD {
         bail!("clipboard too large");
     }
+    let text = match mime {
+        PNG => None,
+        _ => Some(String::from_utf8(data.clone()).context("clipboard text is not UTF-8")?),
+    };
     let pasteboard = NSPasteboard::generalPasteboard();
     unsafe {
-        pasteboard.clearContents();
-        match mime {
-            PNG => {
+        match text {
+            None => {
                 let png = NSData::with_bytes(&data);
+                let rep = NSBitmapImageRep::imageRepWithData(&png).context("clipboard image is not a PNG")?;
+                pasteboard.clearContents();
                 pasteboard.setData_forType(Some(&png), NSPasteboardTypePNG);
-                if let Some(tiff) = NSBitmapImageRep::imageRepWithData(&png).and_then(|rep| rep.TIFFRepresentation()) {
+                if let Some(tiff) = rep.TIFFRepresentation() {
                     pasteboard.setData_forType(Some(&tiff), NSPasteboardTypeTIFF);
                 }
             }
-            _ => {
-                let text = String::from_utf8(data).context("clipboard text is not UTF-8")?;
+            Some(text) => {
+                pasteboard.clearContents();
                 pasteboard.setString_forType(&NSString::from_str(&text), NSPasteboardTypeString);
             }
         }
@@ -145,7 +150,7 @@ pub async fn read() -> Result<Option<Content>> {
 }
 
 pub async fn write(content: &Content) -> Result<()> {
-    let Some(user) = console_user() else { return Ok(()) };
+    let Some(user) = console_user() else { bail!("nobody is logged in at the Mac") };
     let mime = if content.0 == PNG { PNG } else { TEXT };
     let mut child = helper(&user, &["clip-set", "--mime", mime])?
         .stdin(Stdio::piped())

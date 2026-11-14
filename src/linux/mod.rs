@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const TICK: Duration = Duration::from_millis(25);
 const HEARTBEAT_CAPTURED: Duration = Duration::from_millis(100);
@@ -36,6 +36,7 @@ const TOGGLE_WINDOW: Duration = Duration::from_millis(1500);
 const REARM_DELAY: Duration = Duration::from_millis(400);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const REOPEN_DELAY: Duration = Duration::from_secs(2);
+const SLAM_RETRY: Duration = Duration::from_millis(250);
 
 struct Capture {
     activation_id: Option<u32>,
@@ -52,8 +53,18 @@ struct Capture {
 }
 
 enum ClipJob {
-    Push,
-    Pull,
+    Push { peer: SocketAddr, token: u64 },
+    Pull { peer: SocketAddr, token: u64 },
+    Flush(oneshot::Sender<()>),
+}
+
+/// A hotkey switch in progress: where the cursor was, and the shoves still to try if the
+/// previous one did not reach the barrier.
+struct Toggle {
+    position: Option<(f64, f64)>,
+    started: Instant,
+    plans: Vec<Option<(i32, i32)>>,
+    next_attempt: Instant,
 }
 
 struct Daemon {
@@ -62,16 +73,17 @@ struct Daemon {
     link: Link,
     portal: Option<Portal>,
     capture: Option<Capture>,
-    pending_toggle: Option<(Option<(f64, f64)>, Instant)>,
+    pending_toggle: Option<Toggle>,
     slammer: Option<slam::Slammer>,
     bus: zbus::Connection,
-    clip_jobs: mpsc::UnboundedSender<(ClipJob, SocketAddr, u64)>,
+    clip_jobs: mpsc::UnboundedSender<ClipJob>,
     rearm_at: Option<Instant>,
     reopen_at: Option<Instant>,
     last_heartbeat: Instant,
     portal_error: Option<String>,
     opening: bool,
     opened: mpsc::UnboundedSender<Result<(Portal, Ei, PortalSignals)>>,
+    session_lost: Option<String>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -106,6 +118,7 @@ pub async fn run(config: Config) -> Result<()> {
         portal_error: None,
         opening: false,
         opened: opened_tx,
+        session_lost: None,
     };
     let mut ei: Option<Ei> = None;
     let mut streams = Streams::default();
@@ -131,39 +144,33 @@ pub async fn run(config: Config) -> Result<()> {
                     }
                     daemon.on_ei(event).await;
                 }
-                other => {
-                    tracing::warn!("input capture connection ended: {other:?}");
-                    daemon.drop_portal().await;
-                    ei = None;
-                    streams = Streams::default();
-                    daemon.reopen_at = Some(Instant::now() + REOPEN_DELAY);
-                }
+                other => daemon.session_lost = Some(format!("the input capture connection ended: {other:?}")),
             },
-            activated = next_signal(&mut streams.activated) => {
-                if let Some(activated) = activated {
-                    daemon.on_activated(activated).await;
-                }
-            }
-            deactivated = next_signal(&mut streams.deactivated) => {
-                if deactivated.is_some() {
-                    daemon.end_capture("the compositor ended the capture").await;
-                }
-            }
-            disabled = next_signal(&mut streams.disabled) => {
-                if disabled.is_some() {
+            activated = next_signal(&mut streams.activated) => match activated {
+                Some(activated) => daemon.on_activated(activated).await,
+                None => daemon.session_lost = Some("portal signals stopped".into()),
+            },
+            deactivated = next_signal(&mut streams.deactivated) => match deactivated {
+                Some(deactivated) => daemon.on_deactivated(deactivated.activation_id()).await,
+                None => daemon.session_lost = Some("portal signals stopped".into()),
+            },
+            disabled = next_signal(&mut streams.disabled) => match disabled {
+                Some(_) => {
                     daemon.end_capture("capture disabled").await;
                     if let Some(portal) = daemon.portal.as_mut() {
                         portal.armed = false;
                     }
                     daemon.rearm_at = Some(Instant::now() + REARM_DELAY);
                 }
-            }
-            zones = next_signal(&mut streams.zones_changed) => {
-                if zones.is_some() {
+                None => daemon.session_lost = Some("portal signals stopped".into()),
+            },
+            zones = next_signal(&mut streams.zones_changed) => match zones {
+                Some(_) => {
                     tracing::info!("screens changed; re-placing the barrier");
                     daemon.rearm_at = Some(Instant::now() + REARM_DELAY);
                 }
-            }
+                None => daemon.session_lost = Some("portal signals stopped".into()),
+            },
             result = opened.recv() => {
                 daemon.opening = false;
                 match result {
@@ -206,6 +213,13 @@ pub async fn run(config: Config) -> Result<()> {
             }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
+        }
+        if let Some(reason) = daemon.session_lost.take() {
+            tracing::warn!("reopening input capture: {reason}");
+            daemon.drop_portal().await;
+            ei = None;
+            streams = Streams::default();
+            daemon.reopen_at = Some(Instant::now() + REOPEN_DELAY);
         }
     }
     daemon.shutdown().await;
@@ -270,7 +284,7 @@ impl Daemon {
     }
 
     async fn on_datagram(&mut self, packet: &[u8], from: SocketAddr) {
-        match self.link.accept(packet, from) {
+        match self.link.accept(packet, from).await {
             Some(Incoming::Connected) => {
                 self.rearm_at = Some(Instant::now());
                 self.last_heartbeat = Instant::now() - HEARTBEAT_IDLE;
@@ -299,12 +313,12 @@ impl Daemon {
             .cursor_position()
             .map(|(x, y)| (x as f64, y as f64))
             .unwrap_or_else(|| portal::edge_point(edge.region, side, 0.5));
-        let toggled = self.pending_toggle.take().filter(|(_, at)| at.elapsed() < TOGGLE_WINDOW);
+        let toggled = self.pending_toggle.take().filter(|toggle| toggle.started.elapsed() < TOGGLE_WINDOW);
         let mut capture = Capture {
             activation_id: activated.activation_id(),
             edge,
             entry,
-            return_to: toggled.and_then(|(position, _)| position),
+            return_to: toggled.as_ref().and_then(|toggle| toggle.position),
             via_hotkey: toggled.is_some(),
             since: Instant::now(),
             pressed: BTreeSet::new(),
@@ -329,7 +343,7 @@ impl Daemon {
         self.capture = Some(capture);
         self.link.send(Msg::Enter { side: side.to_wire(), frac, speed: self.config.speed }).await;
         self.heartbeat().await;
-        self.queue_clipboard(ClipJob::Push);
+        self.queue_clipboard(true);
     }
 
     async fn on_ei(&mut self, event: EiEvent) {
@@ -416,18 +430,30 @@ impl Daemon {
         tracing::info!("released ({reason}) after {:.1} s", capture.since.elapsed().as_secs_f32());
         self.link.send(Msg::Leave).await;
         if let Some(portal) = &self.portal
-            && let Err(error) = portal.release(capture.activation_id, target).await {
-                tracing::warn!("releasing capture: {error:#}");
-            }
-        self.queue_clipboard(ClipJob::Pull);
+            && let Err(error) = portal.release(capture.activation_id, target).await
+        {
+            self.session_lost = Some(format!("releasing the capture failed: {error:#}"));
+        }
+        self.queue_clipboard(false);
     }
 
     async fn end_capture(&mut self, reason: &str) {
         if let Some(capture) = self.capture.take() {
             tracing::info!("capture ended ({reason}) after {:.1} s", capture.since.elapsed().as_secs_f32());
             self.link.send(Msg::Leave).await;
-            self.queue_clipboard(ClipJob::Pull);
+            self.queue_clipboard(false);
         }
+    }
+
+    /// Ends the capture the compositor deactivated, ignoring a late signal for an earlier one.
+    async fn on_deactivated(&mut self, activation_id: Option<u32>) {
+        let current = self.capture.as_ref().and_then(|capture| capture.activation_id);
+        if let (Some(ended), Some(current)) = (activation_id, current)
+            && ended != current
+        {
+            return;
+        }
+        self.end_capture("the compositor ended the capture").await;
     }
 
     async fn on_toggle(&mut self, position: Option<(f64, f64)>) {
@@ -452,13 +478,27 @@ impl Daemon {
             control::notify(&self.bus, "Input capture is not ready", self.portal_error.as_deref().unwrap_or("")).await;
             return;
         };
-        let Some(slammer) = self.slammer.as_mut() else {
+        if self.slammer.is_none() {
             control::notify(&self.bus, "Hotkey needs /dev/uinput", "Move the pointer past the edge instead").await;
             return;
-        };
-        let (toward, perpendicular) = slam_plan(self.config.side, portal.edges(), position);
-        self.pending_toggle = Some((position, Instant::now()));
-        if let Err(error) = slammer.slam(toward, perpendicular).await {
+        }
+        let plans = slam_plans(self.config.side, portal.edges(), position);
+        self.pending_toggle = Some(Toggle { position, started: Instant::now(), plans, next_attempt: Instant::now() });
+        self.advance_toggle().await;
+    }
+
+    /// Tries the next shove toward the barrier when the previous one has not started a capture.
+    async fn advance_toggle(&mut self) {
+        let side = self.config.side;
+        let Some(toggle) = self.pending_toggle.as_mut() else { return };
+        if self.capture.is_some() || Instant::now() < toggle.next_attempt || toggle.plans.is_empty() {
+            return;
+        }
+        let perpendicular = toggle.plans.remove(0);
+        toggle.next_attempt = Instant::now() + SLAM_RETRY;
+        if let Some(slammer) = self.slammer.as_mut()
+            && let Err(error) = slammer.slam(toward(side), perpendicular).await
+        {
             tracing::warn!("hotkey pointer: {error}");
         }
     }
@@ -487,7 +527,6 @@ impl Daemon {
     }
 
     async fn tick(&mut self) {
-        let was_connected = self.link.connected();
         self.link.maintain().await;
         let connected = self.link.connected();
 
@@ -501,16 +540,20 @@ impl Daemon {
             control::notify(&self.bus, "Lost the Mac", "Mouse and keyboard are back on this desktop").await;
         }
 
-        if was_connected && !connected
-            && let Some(portal) = self.portal.as_mut() {
-                portal.disarm().await;
-            }
+        if !connected
+            && let Some(portal) = self.portal.as_mut()
+            && portal.armed
+        {
+            portal.disarm().await;
+            self.rearm_at = Some(Instant::now());
+        }
         if connected && self.capture.is_none() && self.rearm_at.is_some_and(|at| Instant::now() >= at) {
             self.rearm_at = None;
             self.arm().await;
         }
 
-        if self.pending_toggle.as_ref().is_some_and(|(_, at)| at.elapsed() > TOGGLE_WINDOW) {
+        self.advance_toggle().await;
+        if self.pending_toggle.as_ref().is_some_and(|toggle| toggle.started.elapsed() > TOGGLE_WINDOW) {
             self.pending_toggle = None;
             control::notify(&self.bus, "Could not reach the edge", "Move the pointer past the edge instead").await;
         }
@@ -521,12 +564,14 @@ impl Daemon {
         }
     }
 
-    fn queue_clipboard(&self, job: ClipJob) {
+    /// Pushes this desktop's clipboard to the Mac on the way over, or pulls the Mac's on the way back.
+    fn queue_clipboard(&self, push: bool) {
         if !self.config.clipboard {
             return;
         }
         if let (Some(peer), Some(token)) = (self.link.peer, self.link.token) {
-            let _ = self.clip_jobs.send((job, peer, token));
+            let job = if push { ClipJob::Push { peer, token } } else { ClipJob::Pull { peer, token } };
+            let _ = self.clip_jobs.send(job);
         }
     }
 
@@ -578,6 +623,10 @@ impl Daemon {
         if self.capture.is_some() {
             let target = self.return_point();
             self.release(target, "shutting down").await;
+            let (done, finished) = oneshot::channel();
+            if self.clip_jobs.send(ClipJob::Flush(done)).is_ok() {
+                let _ = tokio::time::timeout(Duration::from_secs(6), finished).await;
+            }
         }
         if let Some(portal) = &self.portal {
             portal.close().await;
@@ -601,16 +650,22 @@ fn wheel_to_hid(dx: f32, dy: f32, natural: bool) -> (f32, f32) {
     if natural { (-dx, dy) } else { (dx, -dy) }
 }
 
-/// Decides which way to shove the cursor so it lands on, and then pushes through, the barrier.
-fn slam_plan(side: Side, edges: &[Edge], position: Option<(f64, f64)>) -> ((i32, i32), Option<(i32, i32)>) {
-    let toward = match side {
+fn toward(side: Side) -> (i32, i32) {
+    match side {
         Side::Left => (-1, 0),
         Side::Right => (1, 0),
         Side::Top => (0, -1),
         Side::Bottom => (0, 1),
-    };
-    let Some((x, y)) = position else { return (toward, None) };
+    }
+}
+
+/// The perpendicular shoves to try, in order, before pushing into the barrier: none when the
+/// cursor already lines up with the barrier, otherwise toward the barrier's span first and the
+/// other way second, since a big shove can overshoot the span on unevenly stacked screens.
+fn slam_plans(side: Side, edges: &[Edge], position: Option<(f64, f64)>) -> Vec<Option<(i32, i32)>> {
     let vertical_edge = matches!(side, Side::Left | Side::Right);
+    let step = |sign: i32| if vertical_edge { Some((0, sign)) } else { Some((sign, 0)) };
+    let Some((x, y)) = position else { return vec![None, step(-1), step(1)] };
     let spans: Vec<(f64, f64)> = edges
         .iter()
         .map(|edge| {
@@ -624,50 +679,57 @@ fn slam_plan(side: Side, edges: &[Edge], position: Option<(f64, f64)>) -> ((i32,
         .collect();
     let along = if vertical_edge { y } else { x };
     if spans.iter().any(|(start, end)| along >= *start && along < *end) {
-        return (toward, None);
+        return vec![None, step(-1), step(1)];
     }
     let lowest = spans.iter().map(|(start, _)| *start).fold(f64::INFINITY, f64::min);
-    let step = if along < lowest { 1 } else { -1 };
-    let perpendicular = if vertical_edge { (0, step) } else { (step, 0) };
-    (toward, Some(perpendicular))
+    let first = if along < lowest { 1 } else { -1 };
+    vec![step(first), step(-first), None]
 }
 
-/// Runs clipboard transfers one at a time so their counters reach the Mac in order.
-async fn clipboard_worker(cipher: Rc<Cipher>, mut jobs: mpsc::UnboundedReceiver<(ClipJob, SocketAddr, u64)>) {
+/// Runs clipboard transfers one at a time so their counters reach the Mac in order. `synced` is
+/// the digest of the last content that crossed in either direction, so nothing is sent twice.
+async fn clipboard_worker(cipher: Rc<Cipher>, mut jobs: mpsc::UnboundedReceiver<ClipJob>) {
     let mut counter = Counter::new();
     let mut synced: Option<[u8; 32]> = None;
-    let mut last_reply = 0u64;
-    while let Some((job, peer, token)) = jobs.recv().await {
+    while let Some(job) = jobs.recv().await {
         let result: Result<()> = async {
             match job {
-                ClipJob::Push => {
+                ClipJob::Flush(done) => {
+                    let _ = done.send(());
+                }
+                ClipJob::Push { peer, token } => {
                     let Some(content) = clipboard::read().await? else { return Ok(()) };
                     let hash = clipboard::digest(&content);
                     if synced == Some(hash) {
                         return Ok(());
                     }
-                    let frame = cipher.seal(
-                        &Envelope { token, counter: counter.next(), msg: Msg::ClipPut { mime: content.0, data: content.1 } }
-                            .encode(),
-                    );
-                    let reply = clipboard::exchange(&cipher, peer, frame, token).await?;
-                    if reply.counter > last_reply {
-                        last_reply = reply.counter;
-                        synced = Some(hash);
+                    let request = counter.next();
+                    let msg = Msg::ClipPut { mime: content.0, data: content.1 };
+                    let frame = cipher.seal(&Envelope { token, counter: request, msg }.encode());
+                    match clipboard::exchange(&cipher, peer, frame, token).await?.msg {
+                        Msg::ClipNone { echo } if echo == request => synced = Some(hash),
+                        _ => anyhow::bail!("the Mac did not take the clipboard"),
                     }
                 }
-                ClipJob::Pull => {
-                    let frame = cipher.seal(&Envelope { token, counter: counter.next(), msg: Msg::ClipGet }.encode());
-                    let reply = clipboard::exchange(&cipher, peer, frame, token).await?;
-                    if reply.counter <= last_reply {
-                        anyhow::bail!("stale clipboard reply");
-                    }
-                    last_reply = reply.counter;
-                    if let Msg::ClipData { mime, data } = reply.msg {
-                        let content = (mime, data);
-                        clipboard::write(&content).await?;
-                        synced = Some(clipboard::digest(&content));
-                        tracing::info!("clipboard from the Mac: {} ({} bytes)", content.0, content.1.len());
+                ClipJob::Pull { peer, token } => {
+                    let before = clipboard::read().await?.map(|content| clipboard::digest(&content));
+                    let request = counter.next();
+                    let msg = Msg::ClipGet { have: synced.unwrap_or([0; 32]) };
+                    let frame = cipher.seal(&Envelope { token, counter: request, msg }.encode());
+                    match clipboard::exchange(&cipher, peer, frame, token).await?.msg {
+                        Msg::ClipData { echo, mime, data } if echo == request => {
+                            let now = clipboard::read().await?.map(|content| clipboard::digest(&content));
+                            if now != before {
+                                tracing::info!("kept this desktop's clipboard: it changed while the Mac's was on its way");
+                                return Ok(());
+                            }
+                            let content = (mime, data);
+                            clipboard::write(&content).await?;
+                            synced = Some(clipboard::digest(&content));
+                            tracing::info!("clipboard from the Mac: {} ({} bytes)", content.0, content.1.len());
+                        }
+                        Msg::ClipNone { echo } if echo == request => {}
+                        _ => anyhow::bail!("unexpected clipboard reply"),
                     }
                 }
             }

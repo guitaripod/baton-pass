@@ -92,6 +92,10 @@ impl Counter {
         self.0 += 1;
         self.0
     }
+
+    pub fn peek(&self) -> u64 {
+        self.0
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
