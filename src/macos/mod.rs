@@ -748,9 +748,6 @@ mod tests {
         let builtin = [rect(0.0, 0.0, 1512.0, 982.0)];
         let decision = edge_decision(&builtin, Side::Right, Point { x: 1520.0, y: 491.0 }, Some((3.0, 0.0)), 2.0);
         match decision {
-            EdgeDecision::Exit { park, .. } if !self.exit_enabled || !self.exit_armed => {
-                self.nudge_to(park);
-            }
             EdgeDecision::Exit { frac, park } => {
                 assert!((frac - 0.5).abs() < 0.01);
                 assert_eq!(park, Point { x: 1510.0, y: 491.0 });
