@@ -133,7 +133,7 @@ async fn drive_paths(
     seed: u64,
     during: impl Fn(Duration, &FakeMac),
 ) -> (Run, Rc<FakeMac>, (Vec<SocketAddr>, Option<SocketAddr>)) {
-    let cipher = Rc::new(Cipher::from_key(KEY));
+    let cipher = Rc::new(Cipher::from_secret(KEY));
     let mac = Rc::new(FakeMac {
         socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
         doorman: RefCell::new(Doorman::new()),

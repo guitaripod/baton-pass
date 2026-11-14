@@ -1,6 +1,7 @@
 mod clip;
 mod config;
 mod crypto;
+mod pair;
 mod proto;
 mod session;
 
@@ -25,6 +26,19 @@ enum Command {
     Run,
     /// Create the shared key if it does not exist yet and print its path
     Keygen,
+    /// Put a fresh shared key on both machines: run `sudo ferry pair` on the Mac first, then
+    /// `ferry pair <code>` here with the code it shows
+    #[cfg(target_os = "linux")]
+    Pair {
+        /// The eight-digit code `sudo ferry pair` shows on the Mac
+        code: String,
+        /// The Mac's address, if not the first configured peer
+        #[arg(long)]
+        peer: Option<String>,
+    },
+    /// Show a pairing code and wait for the desktop to run `ferry pair <code>`
+    #[cfg(target_os = "macos")]
+    Pair,
     /// Switch the mouse and keyboard to the Mac, or back
     #[cfg(target_os = "linux")]
     Toggle,
@@ -81,6 +95,10 @@ fn main() -> Result<()> {
             println!("{}", path.display());
             Ok(())
         }
+        #[cfg(target_os = "linux")]
+        Command::Pair { code, peer } => local.block_on(&runtime, pair::on_desktop(&code, peer)),
+        #[cfg(target_os = "macos")]
+        Command::Pair => local.block_on(&runtime, pair::on_mac()),
         #[cfg(target_os = "linux")]
         Command::Toggle => local.block_on(&runtime, linux::control::toggle()),
         #[cfg(target_os = "linux")]

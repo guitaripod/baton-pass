@@ -29,7 +29,7 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /usr/local/bin/ferry 
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /usr/local/bin/ferry >/dev/null
 
 if ! sudo test -f /usr/local/etc/ferry/key; then
-    echo "missing /usr/local/etc/ferry/key: copy it from the desktop's ~/.config/ferry/key (mode 600, owner root)" >&2
+    echo "no key yet: run \`sudo ferry pair\` here and \`ferry pair <code>\` on the desktop" >&2
 fi
 
 linearmouse="$HOME/.config/linearmouse/linearmouse.json"

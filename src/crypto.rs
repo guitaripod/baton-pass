@@ -26,8 +26,7 @@ impl Cipher {
         Ok(Self(XChaCha20Poly1305::new(key.as_slice().into())))
     }
 
-    #[cfg(all(test, target_os = "linux"))]
-    pub fn from_key(key: [u8; 32]) -> Self {
+    pub fn from_secret(key: [u8; 32]) -> Self {
         Self(XChaCha20Poly1305::new(&key.into()))
     }
 
@@ -60,18 +59,30 @@ pub fn ensure_key(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    write_key(path, &random_key())
+}
+
+pub fn random_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    getrandom::fill(&mut key).map_err(|error| anyhow::anyhow!("system randomness: {error}"))?;
+    getrandom::fill(&mut key).expect("system randomness");
+    key
+}
+
+/// Replaces the key file atomically: written to a private temporary file beside it (mode 600
+/// from the start), then renamed over it.
+pub fn write_key(path: &Path, key: &[u8; 32]) -> Result<()> {
+    let dir = path.parent().context("key path has no folder")?;
+    std::fs::create_dir_all(dir)?;
+    let temporary = dir.join(format!(".key-{}", random_u64()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    writeln!(file, "{}", encode_hex(&key))?;
+        .open(&temporary)
+        .with_context(|| format!("creating {}", temporary.display()))?;
+    writeln!(file, "{}", encode_hex(key))?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 

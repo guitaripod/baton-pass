@@ -23,8 +23,6 @@ KWin ── InputCapture portal + libei ── ferry ═══ UDP, XChaCha20-Po
 
 ## Install
 
-Both machines need the same key, `~/.config/ferry/key` on Arch and `/usr/local/etc/ferry/key` (root, mode 600) on the Mac.
-
 Arch:
 
 ```sh
@@ -36,9 +34,22 @@ The first start shows KDE's input capture dialog. Tick "Allow the application to
 Mac (needs Karabiner-Elements or Karabiner-DriverKit-VirtualHIDDevice installed):
 
 ```sh
-ssh mac 'sudo install -d -m 755 /usr/local/etc/ferry && sudo sh -c "umask 077; cat > /usr/local/etc/ferry/key"' < ~/.config/ferry/key
 scripts/install-mac.sh
 ```
+
+Then pair the two, which puts one fresh key on both (`~/.config/ferry/key` on Arch, `/usr/local/etc/ferry/key` on the Mac, mode 600). On the Mac:
+
+```sh
+sudo ferry pair
+```
+
+It shows an eight-digit code and waits three minutes. On Arch:
+
+```sh
+ferry pair <code>
+```
+
+The code is checked with SPAKE2, so watching the network does not help anyone guess it, and one wrong code closes the window. Both daemons restart on the new key.
 
 ## Use
 
