@@ -50,11 +50,20 @@ def conditions(scheme):
 
 
 ours = {"category": "mouse", "vendorID": "0x16c0", "productID": "0x27da"}
-if not any(c.get("device", {}).get("productID", "").lower() == "0x27da" for s in schemes for c in conditions(s)):
-    schemes.append({"if": {"device": ours}, "pointer": {"disableAcceleration": True}})
+mine = [s for s in schemes if any(c.get("device", {}).get("productID", "").lower() == "0x27da" for c in conditions(s))]
+changed = False
+if not mine:
+    schemes.append({"if": {"device": ours}, "pointer": {"disableAcceleration": True, "speed": 0}})
+    changed = True
+for scheme in mine:
+    pointer = scheme.setdefault("pointer", {})
+    if "speed" not in pointer:
+        pointer["speed"] = 0
+        changed = True
+if changed:
     with open(path, "w") as handle:
         handle.write(json.dumps(config, indent=2) + "\n")
-    print("added a LinearMouse profile that keeps ferry's virtual mouse free of acceleration")
+    print("LinearMouse profile for ferry's virtual mouse: no acceleration, 1200 counts per inch")
 PY
 fi
 
