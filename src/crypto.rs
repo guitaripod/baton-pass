@@ -93,6 +93,7 @@ impl Counter {
         self.0
     }
 
+    #[cfg(target_os = "linux")]
     pub fn peek(&self) -> u64 {
         self.0
     }
