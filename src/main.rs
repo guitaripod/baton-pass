@@ -36,6 +36,10 @@ enum Command {
         #[arg(long = "peer")]
         peers: Vec<String>,
     },
+    /// Check the link and the Mac side without touching local input
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Probe(linux::probe::ProbeArgs),
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
     ClipGet,
@@ -83,6 +87,8 @@ fn main() -> Result<()> {
         Command::Status => local.block_on(&runtime, linux::control::status()),
         #[cfg(target_os = "linux")]
         Command::Install { peers } => local.block_on(&runtime, linux::install::install(peers)),
+        #[cfg(target_os = "linux")]
+        Command::Probe(args) => local.block_on(&runtime, linux::probe::probe(args)),
         #[cfg(target_os = "macos")]
         Command::ClipGet => macos::pasteboard::helper_get(),
         #[cfg(target_os = "macos")]
