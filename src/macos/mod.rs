@@ -55,6 +55,7 @@ struct Receiver {
     entered: bool,
     exiting: Option<(f32, Instant)>,
     exit_side: Side,
+    exit_enabled: bool,
     speed: f32,
     keys: KeyState,
     buttons: u32,
@@ -95,6 +96,7 @@ pub async fn run(config: Config) -> Result<()> {
         entered: false,
         exiting: None,
         exit_side: Side::Right,
+        exit_enabled: true,
         speed: 1.0,
         keys: KeyState::default(),
         buttons: 0,
@@ -229,7 +231,8 @@ impl Receiver {
                 }
                 self.reply(from, token, Msg::Ack { flags }).await;
             }
-            Msg::Enter { side, frac, speed } => {
+            Msg::Enter { side, frac, speed, exit } => {
+                self.exit_enabled = exit;
                 self.enter(Side::from_wire(side).unwrap_or(Side::Left), frac, speed).await;
             }
             Msg::Leave => self.leave("released"),
@@ -451,6 +454,9 @@ impl Receiver {
         let pushing = self.pushed.filter(|(_, _, at)| at.elapsed() < PUSH_MEMORY).map(|(dx, dy, _)| (dx, dy));
         match edge_decision(&self.displays, self.exit_side, cursor, pushing, self.inset()) {
             EdgeDecision::Stay => {}
+            EdgeDecision::Exit { park, .. } if !self.exit_enabled => {
+                self.nudge_to(park);
+            }
             EdgeDecision::Exit { frac, park } => {
                 vhid::pointing(0, 0, 0, 0, 0);
                 self.buttons = 0;
@@ -719,6 +725,9 @@ mod tests {
         let builtin = [rect(0.0, 0.0, 1512.0, 982.0)];
         let decision = edge_decision(&builtin, Side::Right, Point { x: 1520.0, y: 491.0 }, Some((3.0, 0.0)), 2.0);
         match decision {
+            EdgeDecision::Exit { park, .. } if !self.exit_enabled => {
+                self.nudge_to(park);
+            }
             EdgeDecision::Exit { frac, park } => {
                 assert!((frac - 0.5).abs() < 0.01);
                 assert_eq!(park, Point { x: 1510.0, y: 491.0 });

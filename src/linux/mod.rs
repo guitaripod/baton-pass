@@ -314,6 +314,13 @@ impl Daemon {
             .map(|(x, y)| (x as f64, y as f64))
             .unwrap_or_else(|| portal::edge_point(edge.region, side, 0.5));
         let toggled = self.pending_toggle.take().filter(|toggle| toggle.started.elapsed() < TOGGLE_WINDOW);
+        if toggled.is_none() && !self.config.edge {
+            let back = portal::edge_point(edge.region, side, portal::edge_fraction(edge.region, side, entry.0, entry.1));
+            if let Err(error) = portal.release(activated.activation_id(), back).await {
+                self.session_lost = Some(format!("releasing an edge crossing failed: {error:#}"));
+            }
+            return;
+        }
         let mut capture = Capture {
             activation_id: activated.activation_id(),
             edge,
@@ -341,7 +348,7 @@ impl Daemon {
         };
         tracing::info!("captured at {entry:?}{}", if capture.via_hotkey { " by hotkey" } else { "" });
         self.capture = Some(capture);
-        self.link.send(Msg::Enter { side: side.to_wire(), frac, speed: self.config.speed }).await;
+        self.link.send(Msg::Enter { side: side.to_wire(), frac, speed: self.config.speed, exit: self.config.edge }).await;
         self.heartbeat().await;
         self.queue_clipboard(true);
     }
@@ -548,9 +555,16 @@ impl Daemon {
             portal.disarm().await;
             self.rearm_at = Some(Instant::now());
         }
-        if connected && self.capture.is_none() && self.rearm_at.is_some_and(|at| Instant::now() >= at) {
+        if connected && self.config.edge && self.capture.is_none() && self.rearm_at.is_some_and(|at| Instant::now() >= at) {
             self.rearm_at = None;
             self.arm().await;
+        }
+        let needed = self.config.edge || self.capture.is_some() || self.pending_toggle.is_some();
+        if !needed
+            && let Some(portal) = self.portal.as_mut()
+            && portal.armed
+        {
+            portal.disarm().await;
         }
 
         self.advance_toggle().await;
@@ -604,6 +618,7 @@ impl Daemon {
                 capture.since.elapsed().as_secs_f32(),
                 if capture.via_hotkey { " (hotkey)" } else { "" }
             ),
+            (None, Some(_)) if !self.config.edge => format!("capture: hotkey only ({}), edge off", self.hotkey.qt_name()),
             (None, Some(portal)) if portal.armed => format!(
                 "capture: armed on the {:?} edge ({} barrier(s)), hotkey {}",
                 self.config.side,

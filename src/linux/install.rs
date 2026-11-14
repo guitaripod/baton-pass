@@ -157,6 +157,8 @@ fn default_config(peers: &[String]) -> String {
 side = "left"
 # Here it sends the mouse and keyboard to the Mac; on the Mac it brings them back.
 hotkey = "Meta+Escape"
+# Also switch by pushing the pointer off that edge (and back off the Mac's opposite edge).
+edge = true
 # Mac points travelled per pixel moved here.
 speed = 1.0
 # This desktop's natural-scrolling setting, so the wheel turns the same way on the Mac.

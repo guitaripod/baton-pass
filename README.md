@@ -54,6 +54,7 @@ scripts/install-mac.sh
 | `peers` | | Mac addresses tried in order; put the wired LAN address first |
 | `side` | `"left"` | the desktop edge the Mac sits beyond |
 | `hotkey` | `"Meta+Escape"` | re-run `ferry install` after changing it |
+| `edge` | `true` | also switch by pushing off the desktop edge, and back off the Mac's; `false` makes the hotkey the only switch |
 | `speed` | `1.0` | Mac points per desktop pixel |
 | `natural_scroll` | `true` | match the desktop's natural-scrolling setting |
 | `swap_alt_meta` | `false` | send Alt as Command and Meta as Option |

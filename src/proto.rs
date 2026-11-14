@@ -25,7 +25,7 @@ pub enum Msg {
     Reset { token: u64, counter: u64 },
     Heartbeat { entered: bool, keys: KeyState, buttons: u32 },
     Ack { flags: u8 },
-    Enter { side: u8, frac: f32, speed: f32 },
+    Enter { side: u8, frac: f32, speed: f32, exit: bool },
     Leave,
     Pointer { dx: f32, dy: f32, wheel_v: i32, wheel_h: i32, buttons: u32 },
     Keys(KeyState),
@@ -73,11 +73,12 @@ impl Envelope {
                 out.push(4);
                 out.push(*flags);
             }
-            Msg::Enter { side, frac, speed } => {
+            Msg::Enter { side, frac, speed, exit } => {
                 out.push(5);
                 out.push(*side);
                 out.extend_from_slice(&frac.to_le_bytes());
                 out.extend_from_slice(&speed.to_le_bytes());
+                out.push(u8::from(*exit));
             }
             Msg::Leave => out.push(6),
             Msg::Pointer { dx, dy, wheel_v, wheel_h, buttons } => {
@@ -143,7 +144,7 @@ impl Envelope {
                 buttons: reader.u32()?,
             },
             4 => Msg::Ack { flags: reader.u8()? },
-            5 => Msg::Enter { side: reader.u8()?, frac: reader.f32()?, speed: reader.f32()? },
+            5 => Msg::Enter { side: reader.u8()?, frac: reader.f32()?, speed: reader.f32()?, exit: reader.u8()? != 0 },
             6 => Msg::Leave,
             7 => Msg::Pointer {
                 dx: reader.f32()?,
@@ -262,7 +263,7 @@ mod tests {
         round_trip(Msg::Reset { token: 9, counter: 12 });
         round_trip(Msg::Heartbeat { entered: true, keys: keys.clone(), buttons: 5 });
         round_trip(Msg::Ack { flags: FLAG_ENTERED | FLAG_POINTING_READY });
-        round_trip(Msg::Enter { side: 0, frac: 0.25, speed: 1.5 });
+        round_trip(Msg::Enter { side: 0, frac: 0.25, speed: 1.5, exit: true });
         round_trip(Msg::Leave);
         round_trip(Msg::Pointer { dx: -3.5, dy: 2.25, wheel_v: -120, wheel_h: 60, buttons: 1 });
         round_trip(Msg::Keys(keys));

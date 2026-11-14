@@ -92,7 +92,7 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
     println!("mac flags: {:#04x}", link.flags);
 
     if moves {
-        link.send(Msg::Enter { side: Side::Left.to_wire(), frac: if hotkey { f32::NAN } else { 0.5 }, speed: 1.0 }).await;
+        link.send(Msg::Enter { side: Side::Left.to_wire(), frac: if hotkey { f32::NAN } else { 0.5 }, speed: 1.0, exit: true }).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         link.send(Msg::Heartbeat { entered: true, keys: Default::default(), buttons: 0 }).await;
         let packets = (200.0 / step).round().max(1.0) as usize;
@@ -109,7 +109,7 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
     }
 
     if wheel != 0 {
-        link.send(Msg::Enter { side: Side::Left.to_wire(), frac: f32::NAN, speed: 1.0 }).await;
+        link.send(Msg::Enter { side: Side::Left.to_wire(), frac: f32::NAN, speed: 1.0, exit: true }).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         for _ in 0..3 {
             link.send(Msg::Pointer { dx: 0.0, dy: 0.0, wheel_v: wheel, wheel_h: 0, buttons: 0 }).await;
@@ -121,7 +121,7 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
     }
 
     if shift {
-        link.send(Msg::Enter { side: Side::Left.to_wire(), frac: f32::NAN, speed: 1.0 }).await;
+        link.send(Msg::Enter { side: Side::Left.to_wire(), frac: f32::NAN, speed: 1.0, exit: true }).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let held = crate::proto::KeyState { modifiers: 0x02 | 0x08, keys: Vec::new(), consumer: Vec::new() };
         link.send(Msg::Keys(held.clone())).await;
@@ -158,7 +158,7 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
     }
 
     if cross {
-        link.send(Msg::Enter { side: Side::Left.to_wire(), frac: 0.25, speed: 1.0 }).await;
+        link.send(Msg::Enter { side: Side::Left.to_wire(), frac: 0.25, speed: 1.0, exit: true }).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let started = Instant::now();
         let mut exit = None;
