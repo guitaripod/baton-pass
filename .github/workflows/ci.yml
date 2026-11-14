@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      mac: ${{ steps.filter.outputs.mac }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            mac:
+              - 'src/macos/**'
+              - 'src/session.rs'
+              - 'src/clip.rs'
+              - 'src/proto.rs'
+              - 'src/crypto.rs'
+              - 'cpp/**'
+              - 'build.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'vendor/**'
+
+  macos:
+    needs: changes
+    if: needs.changes.outputs.mac == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
