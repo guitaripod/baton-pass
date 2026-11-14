@@ -12,12 +12,14 @@ KWin ── InputCapture portal + libei ── ferry ═══ UDP, XChaCha20-Po
             pointer barrier on the left edge          ~0.25 ms round trip on wired gigabit
 ```
 
-- **Capture.** `ferry run` asks KDE's InputCapture portal for a pointer barrier along the outer edge of the desktop. When the pointer crosses it, KWin hands every input event to ferry, Meta and other shortcuts included, and hides the local cursor. Escape hatches: the hotkey, KWin's own Meta+Shift+Esc, and an automatic release when the Mac stops answering for 750 ms.
+- **Capture.** `ferry run` asks KDE's InputCapture portal for a pointer barrier along the outer edge of the desktop. When the pointer crosses it, KWin hands every input event to ferry, Meta and other shortcuts included, and hides the local cursor. Escape hatches: the hotkey, KWin's own Meta+Shift+Esc, and an automatic release when the Mac stops answering for 1.5 s.
 - **Hotkey.** Meta+Esc by default, registered as a KWin script shortcut (rebindable in System Settings → Shortcuts → KWin). On the desktop it carries input to the Mac. A private uinput mouse pushes the pointer into the barrier, which is the only way the portal starts a capture. On the Mac, the same keys bring it back, and the desktop cursor reappears exactly where it was.
-- **Link.** One encrypted datagram per input frame, under a pre-shared 256-bit key. The Mac hands out a fresh session token on every handshake, and both sides reject replayed or reordered packets. Every key packet and heartbeat carries the full key and button state, so a lost packet can never leave a key stuck. If either side goes quiet, the Mac releases everything.
+- **Link.** One encrypted datagram per input frame, under a pre-shared 256-bit key. The Mac hands out a fresh session token on every handshake, and both sides reject replayed or reordered packets. Every key packet and heartbeat carries the full key and button state, so a lost packet can never leave a key stuck.
+- **Riding out gaps.** Each side counts the other's silence only over time its own loop was running, and reads every queued packet before judging it, so a stall on one machine is never blamed on the other. After half a second of silence the Mac lets go of held keys and buttons but keeps control, picking up again with the next packet; the desktop takes input back after 1.5 s, and the link drops after 3 s. The desktop greets the wired address first and moves back to it from the tailnet whenever it answers again while nothing is captured. Stalls over 150 ms and handlers holding a loop for over 50 ms are logged with their cause. `cargo test` drives the real link through a relay that loses, duplicates, reorders and blacks out packets.
 - **Injection.** The Mac daemon posts HID reports to Karabiner's virtual devices, one per mouse report on the desktop, so the cursor gets several fresh positions in every frame of a 120 Hz ProMotion display. It turns macOS pointer acceleration off for the virtual mouse (through a LinearMouse profile when LinearMouse runs), measures how many points one count moves, and keeps watching during use, adjusting only when that ratio really changes, never with measurement noise. The result is that one desktop pixel moves the Mac cursor one point at every speed, at a constant gain.
 - **Edges.** The Mac cursor appears at the matching height on the Mac's right edge. It stays on the built-in display, even though the Mac also lists the desktop monitors' spare inputs as screens, and it parks just inside the edge when control goes back.
-- **Clipboard.** On each switch, whichever side you leave pushes its clipboard (UTF-8 text or PNG; macOS TIFF is converted) over an authenticated TCP exchange. Unchanged content is never resent.
+- **Clipboard.** On each switch, whichever side you leave pushes its clipboard over an authenticated TCP exchange, in every format the other side understands: HTML and RTF with the plain text, and PNG images (macOS TIFF is converted). Files copied in a file manager on the desktop (up to 32 MB, folders included) arrive on the Mac's pasteboard ready to paste in Finder. Neither side sends back what it just received. The desktop clipboard is read and served over Wayland's data-control protocol, so wl-clipboard is not needed.
+- **Tray.** A system tray icon shows which machine has the mouse and keyboard and whether the Mac is linked, and its tooltip names the last hiccup. A click switches.
 
 ## Install
 
@@ -42,7 +44,7 @@ scripts/install-mac.sh
 
 - Move the pointer off the left edge of the desktop, or press Meta+Esc.
 - Come back by moving off the Mac's right edge, or press Meta+Esc again.
-- `ferry status` shows the link, the Mac's virtual devices and the capture state.
+- `ferry status` shows the link and its round trip, the Mac's virtual devices, the capture state and recent hiccups.
 - `ferry probe` times round trips to the Mac without touching local input. `--moves`, `--cross`, `--wheel 120`, `--shift` and `--clip <text>` exercise the injection, edge, scroll, keyboard and clipboard paths.
 
 ## Configuration
