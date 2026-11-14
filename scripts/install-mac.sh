@@ -17,14 +17,27 @@ fi
 
 git submodule update --init --depth 1
 cargo build --release
-sudo install -d -m 755 /usr/local/bin /usr/local/etc/baton-pass
-sudo install -m 755 target/release/baton-pass /usr/local/bin/baton-pass
-identity=$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/ {print $2; exit}')
-if [ -n "$identity" ] && sudo codesign -f -s "$identity" /usr/local/bin/baton-pass 2>/dev/null; then
+
+# Signs with the Developer ID kept in its own keychain (unlocked with a password file, so this
+# works over ssh, where the login keychain stays locked). A stable signature keeps the Full Disk
+# Access grant across updates; without the identity the binary is signed ad hoc.
+signing_keychain="$HOME/Library/Keychains/baton-pass-signing.keychain-db"
+signing_password="$HOME/.appstoreconnect/private_keys/baton-pass-signing.password"
+identity=""
+if [ -f "$signing_keychain" ] && [ -f "$signing_password" ]; then
+    security unlock-keychain -p "$(cat "$signing_password")" "$signing_keychain"
+    identity=$(security find-identity -v -p codesigning "$signing_keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+fi
+if [ -n "$identity" ]; then
+    codesign --force --options runtime --timestamp --identifier dev.batonpass.BatonPass \
+        --keychain "$signing_keychain" --sign "$identity" target/release/baton-pass
     echo "signed with $identity"
 else
-    sudo codesign -f -s - /usr/local/bin/baton-pass
+    codesign --force --sign - --identifier dev.batonpass.BatonPass target/release/baton-pass
+    echo "no Developer ID identity; signed ad hoc" >&2
 fi
+sudo install -d -m 755 /usr/local/bin /usr/local/etc/baton-pass
+sudo install -m 755 target/release/baton-pass /usr/local/bin/baton-pass
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /usr/local/bin/baton-pass >/dev/null
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /usr/local/bin/baton-pass >/dev/null
 
