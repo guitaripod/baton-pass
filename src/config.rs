@@ -61,6 +61,29 @@ fn with_default_port(peer: &str) -> String {
     }
 }
 
+/// Baton Pass's folder under an XDG base directory: `$variable`, or `~/home_relative` when it is
+/// unset.
+#[cfg(target_os = "linux")]
+pub fn xdg_dir(variable: &str, home_relative: &str) -> PathBuf {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(home_relative)))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("baton-pass")
+}
+
+/// A configured peer (a host, `host:port`, or an IPv6 address bare or in brackets) with its
+/// port replaced by `port`.
+#[cfg(target_os = "linux")]
+pub fn with_port(peer: &str, port: u16) -> String {
+    let host = match peer.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None if peer.matches(':').count() == 1 => peer.split(':').next().unwrap_or(peer),
+        None => peer,
+    };
+    if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Confine {
@@ -108,11 +131,7 @@ impl Config {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("baton-pass")
+            xdg_dir("XDG_CONFIG_HOME", ".config")
         }
     }
 
@@ -140,5 +159,18 @@ impl Config {
     #[cfg(target_os = "linux")]
     pub fn peer_addresses(&self) -> Vec<String> {
         self.peers.iter().map(|peer| with_default_port(peer)).collect()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ports_are_replaced_on_every_peer_form() {
+        assert_eq!(with_port("192.168.1.58", 47475), "192.168.1.58:47475");
+        assert_eq!(with_port("macbook:47474", 47475), "macbook:47475");
+        assert_eq!(with_port("fe80::1", 47475), "[fe80::1]:47475");
+        assert_eq!(with_port("[fe80::1]:47474", 47475), "[fe80::1]:47475");
     }
 }

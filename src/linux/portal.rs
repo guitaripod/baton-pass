@@ -298,6 +298,11 @@ pub fn edge_fraction(region: Region, side: Side, x: f64, y: f64) -> f32 {
     fraction.clamp(0.0, 1.0) as f32
 }
 
+/// The point `inset` pixels inside the edge, level with where `crossed` met it.
+pub fn back_point(region: Region, side: Side, crossed: (f64, f64), inset: f64) -> (f64, f64) {
+    edge_point(region, side, edge_fraction(region, side, crossed.0, crossed.1), inset)
+}
+
 /// The point `inset` pixels inside the edge at `fraction`, where the cursor reappears.
 pub fn edge_point(region: Region, side: Side, fraction: f32, inset: f64) -> (f64, f64) {
     let (x, y) = (region.x_offset() as f64, region.y_offset() as f64);
@@ -313,11 +318,7 @@ pub fn edge_point(region: Region, side: Side, fraction: f32, inset: f64) -> (f64
 }
 
 fn state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("baton-pass")
+    crate::config::xdg_dir("XDG_STATE_HOME", ".local/state")
 }
 
 fn load_restore_token() -> Option<String> {

@@ -66,15 +66,12 @@ pub fn to_hid(code: u32, swap_alt_meta: bool) -> Option<Hid> {
     })
 }
 
+/// The evdev codes of A to Z, in alphabetical order (HID usages and Qt keys run in the same order).
+const LETTERS: [u32; 26] = [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44];
+
 fn keyboard_usage(code: u32) -> Option<u16> {
-    const LETTERS: [(u32, u16); 26] = [
-        (30, 0x04), (48, 0x05), (46, 0x06), (32, 0x07), (18, 0x08), (33, 0x09), (34, 0x0a),
-        (35, 0x0b), (23, 0x0c), (36, 0x0d), (37, 0x0e), (38, 0x0f), (50, 0x10), (49, 0x11),
-        (24, 0x12), (25, 0x13), (16, 0x14), (19, 0x15), (31, 0x16), (20, 0x17), (22, 0x18),
-        (47, 0x19), (17, 0x1a), (45, 0x1b), (21, 0x1c), (44, 0x1d),
-    ];
-    if let Some((_, usage)) = LETTERS.iter().find(|(evdev, _)| *evdev == code) {
-        return Some(*usage);
+    if let Some(index) = LETTERS.iter().position(|letter| *letter == code) {
+        return Some(0x04 + index as u16);
     }
     Some(match code {
         2..=10 => 0x1e + (code - 2) as u16,
@@ -286,7 +283,6 @@ impl Hotkey {
 }
 
 fn qt_key(code: u32) -> Option<i32> {
-    const LETTERS: [u32; 26] = [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44];
     if let Some(index) = LETTERS.iter().position(|letter| *letter == code) {
         return Some(0x41 + index as i32);
     }

@@ -1,7 +1,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <pqrs/karabiner/driverkit/virtual_hid_device_driver.hpp>
 #include <pqrs/karabiner/driverkit/virtual_hid_device_service.hpp>
 
@@ -11,9 +10,6 @@ namespace hid_report = pqrs::karabiner::driverkit::virtual_hid_device_driver::hi
 namespace {
 
 enum flag : uint32_t {
-  flag_connected = 1u << 0,
-  flag_driver_activated = 1u << 1,
-  flag_driver_connected = 1u << 2,
   flag_version_mismatched = 1u << 3,
   flag_keyboard_ready = 1u << 4,
   flag_pointing_ready = 1u << 5,
@@ -44,21 +40,11 @@ extern "C" void batonpass_vhid_start(uint16_t vendor_id, uint16_t product_id, ui
                                                       pqrs::hid::country_code::value_t(country_code)};
 
   client->connected.connect([parameters] {
-    set_flag(flag_connected, true);
     client->async_virtual_hid_keyboard_initialize(parameters);
     client->async_virtual_hid_pointing_initialize();
   });
-  client->connect_failed.connect([](auto&&) {
-    set_flag(flag_connected, false);
-  });
   client->closed.connect([] {
     flags.store(0);
-  });
-  client->driver_activated.connect([](bool value) {
-    set_flag(flag_driver_activated, value);
-  });
-  client->driver_connected.connect([](bool value) {
-    set_flag(flag_driver_connected, value);
   });
   client->driver_version_mismatched.connect([](bool value) {
     set_flag(flag_version_mismatched, value);

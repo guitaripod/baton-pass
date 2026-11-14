@@ -1,5 +1,5 @@
 use crate::proto::{
-    FLAG_KEYBOARD_READY, FLAG_POINTING_READY, FLAG_VERSION_MISMATCH, FLAG_VHID_CONNECTED, KeyState,
+    FLAG_KEYBOARD_READY, FLAG_POINTING_READY, FLAG_VERSION_MISMATCH, KeyState,
 };
 
 unsafe extern "C" {
@@ -22,9 +22,6 @@ pub fn start() {
 pub fn flags() -> u8 {
     let raw = unsafe { batonpass_vhid_flags() };
     let mut flags = 0;
-    if raw & 1 != 0 {
-        flags |= FLAG_VHID_CONNECTED;
-    }
     if raw & (1 << 3) != 0 {
         flags |= FLAG_VERSION_MISMATCH;
     }

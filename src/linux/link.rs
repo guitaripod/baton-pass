@@ -130,14 +130,9 @@ impl Link {
         if self.peers.is_empty() {
             return;
         }
-        let nonce = random_u64();
-        if self.nonces.len() == NONCE_MEMORY {
-            self.nonces.pop_front();
-        }
-        self.nonces.push_back(nonce);
+        let packet = self.hello();
         let peer = self.peers[self.next_peer % self.peers.len()].clone();
         self.next_peer = (self.next_peer + 1) % self.peers.len();
-        let packet = self.seal(0, Msg::Hello { nonce });
         if let Some(address) = self.address_of(&peer)
             && let Err(error) = self.socket.send_to(&packet, address).await
         {
@@ -155,15 +150,20 @@ impl Link {
             return;
         }
         self.last_roam = Some(Instant::now());
+        let packet = self.hello();
+        if let Err(error) = self.socket.send_to(&packet, preferred).await {
+            tracing::debug!("hello to {preferred}: {error}");
+        }
+    }
+
+    /// A sealed Hello with a fresh nonce, remembered so the Challenge answering it is accepted.
+    fn hello(&mut self) -> Vec<u8> {
         let nonce = random_u64();
         if self.nonces.len() == NONCE_MEMORY {
             self.nonces.pop_front();
         }
         self.nonces.push_back(nonce);
-        let packet = self.seal(0, Msg::Hello { nonce });
-        if let Err(error) = self.socket.send_to(&packet, preferred).await {
-            tracing::debug!("hello to {preferred}: {error}");
-        }
+        self.seal(0, Msg::Hello { nonce })
     }
 
     /// Whether a handshake packet from `from` may proceed: always when unlinked, and from a

@@ -7,14 +7,13 @@ use crate::clip;
 use crate::config::{Confine, Config, Side};
 use crate::crypto::{Cipher, Counter};
 use crate::session::{Admission, Doorman, Silence};
-use crate::proto::{Envelope, FLAG_ENTERED, KeyState, MAX_CLIPBOARD, Msg};
+use crate::proto::{Envelope, FLAG_ENTERED, KeyState, MAX_CLIPBOARD_FRAME, Msg, read_frame, write_frame};
 use anyhow::{Context, Result, bail};
 use display::{Point, Rect};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -565,7 +564,7 @@ impl Receiver {
     /// for an entry that arrives before any calibration has finished.
     async fn calibrate_now(&mut self) {
         self.begin_calibration().await;
-        while let Some(next_at) = self.calibration.as_ref().map(|calibration| next_at_tokio(calibration.next_at)) {
+        while let Some(next_at) = self.calibration.as_ref().map(|calibration| tokio::time::Instant::from_std(calibration.next_at)) {
             tokio::time::sleep_until(next_at).await;
             self.step_calibration();
         }
@@ -653,10 +652,6 @@ fn post_calibration_move(direction: i8) {
     for _ in 0..CALIBRATION_REPORTS {
         vhid::pointing(0, direction * CALIBRATION_COUNTS, 0, 0, 0);
     }
-}
-
-fn next_at_tokio(at: Instant) -> tokio::time::Instant {
-    tokio::time::Instant::from_std(at)
 }
 
 /// Logs a handler that held the event loop long enough to delay input and replies.
@@ -804,7 +799,7 @@ fn edge_decision(displays: &[Rect], exit: Side, cursor: Point, pushing: Option<(
 async fn serve_clipboard(mut stream: TcpStream, cipher: Rc<Cipher>, gate: Rc<RefCell<Gate>>) {
     let result: Result<()> = async {
         stream.set_nodelay(true)?;
-        let request = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await??;
+        let request = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream, MAX_CLIPBOARD_FRAME)).await??;
         let envelope = cipher
             .open(&request)
             .and_then(|plain| Envelope::decode(&plain))
@@ -841,8 +836,7 @@ async fn serve_clipboard(mut stream: TcpStream, cipher: Rc<Cipher>, gate: Rc<Ref
         };
         let counter = gate.borrow_mut().counter.next();
         let frame = cipher.seal(&Envelope { token, counter, msg: reply }.encode());
-        stream.write_all(&(frame.len() as u32).to_le_bytes()).await?;
-        stream.write_all(&frame).await?;
+        write_frame(&mut stream, &frame).await?;
         Ok(())
     }
     .await;
@@ -851,19 +845,6 @@ async fn serve_clipboard(mut stream: TcpStream, cipher: Rc<Cipher>, gate: Rc<Ref
         tracing::warn!("clipboard: {error:#}");
     }
 }
-
-async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut length = [0u8; 4];
-    stream.read_exact(&mut length).await?;
-    let length = u32::from_le_bytes(length) as usize;
-    if length > MAX_CLIPBOARD + 1024 {
-        bail!("oversized clipboard frame");
-    }
-    let mut frame = vec![0u8; length];
-    stream.read_exact(&mut frame).await?;
-    Ok(frame)
-}
-
 
 #[cfg(test)]
 mod tests {

@@ -89,7 +89,7 @@ impl Item {
 /// Baton Pass's icon in the panel's system tray, served on the daemon's own bus connection.
 pub struct Tray {
     connection: zbus::Connection,
-    shown: Option<Look>,
+    shown: Look,
 }
 
 impl Tray {
@@ -107,20 +107,20 @@ impl Tray {
                 }
             }
         });
-        Ok(Self { connection: connection.clone(), shown: Some(look) })
+        Ok(Self { connection: connection.clone(), shown: look })
     }
 
     /// Updates the icon and tooltip when they changed since the last call.
     pub async fn show(&mut self, look: Look) {
-        if self.shown.as_ref() == Some(&look) {
+        if self.shown == look {
             return;
         }
         let Ok(item) = self.connection.object_server().interface::<_, Item>(ITEM_PATH).await else { return };
-        let previous = self.shown.replace(look.clone());
+        let previous = std::mem::replace(&mut self.shown, look.clone());
         item.get_mut().await.look = look.clone();
         let emitter = item.signal_emitter();
-        let icon_changed = previous.as_ref().is_none_or(|previous| previous.icon != look.icon);
-        let status_changed = previous.as_ref().is_none_or(|previous| previous.status != look.status);
+        let icon_changed = previous.icon != look.icon;
+        let status_changed = previous.status != look.status;
         if icon_changed && let Err(error) = Item::new_icon(emitter).await {
             tracing::debug!("tray icon update: {error}");
         }

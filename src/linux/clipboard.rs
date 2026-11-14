@@ -1,6 +1,6 @@
 use crate::clip::{self, Clip, FILES, HTML, PNG, RTF, TEXT};
 use crate::crypto::Cipher;
-use crate::proto::{Envelope, MAX_CLIPBOARD};
+use crate::proto::{Envelope, MAX_CLIPBOARD, MAX_CLIPBOARD_FRAME, read_frame, write_frame};
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use wl_clipboard_rs::{copy, paste};
 
@@ -94,7 +93,7 @@ fn sources(clip: &Clip) -> Vec<copy::MimeSource> {
 fn read_blocking() -> Result<Option<Clip>> {
     let offered = match paste::get_mime_types_ordered(paste::ClipboardType::Regular, paste::Seat::Unspecified) {
         Ok(offered) => offered,
-        Err(paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => return Ok(None),
+        Err(error) if nothing_copied(&error) => return Ok(None),
         Err(error) => return Err(error).context("listing the clipboard's formats"),
     };
     let has = |mime: &str| offered.iter().any(|offered| offered == mime);
@@ -137,12 +136,17 @@ fn read_blocking() -> Result<Option<Clip>> {
 fn fetch(mime: &str) -> Result<Option<Vec<u8>>> {
     let (pipe, _) = match paste::get_contents(paste::ClipboardType::Regular, paste::Seat::Unspecified, paste::MimeType::Specific(mime)) {
         Ok(contents) => contents,
-        Err(paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType) => return Ok(None),
+        Err(error) if nothing_copied(&error) => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("reading {mime} from the clipboard")),
     };
     let mut data = Vec::new();
     pipe.take(MAX_CLIPBOARD as u64 + 1).read_to_end(&mut data)?;
     Ok((!data.is_empty() && data.len() <= MAX_CLIPBOARD).then_some(data))
+}
+
+/// The paste errors that only mean there is nothing (of that format) on the clipboard.
+fn nothing_copied(error: &paste::Error) -> bool {
+    matches!(error, paste::Error::NoSeats | paste::Error::ClipboardEmpty | paste::Error::NoMimeType)
 }
 
 /// X11's STRING target is Latin-1; everything sent on is UTF-8.
@@ -175,11 +179,7 @@ fn files_from_uri_list(list: &str) -> Option<Vec<u8>> {
 /// managers copy files, so pasting in Dolphin copies them.
 fn file_sources(bundle: &[u8]) -> Result<Vec<copy::MimeSource>> {
     let files = clip::decode_files(bundle).context("malformed file bundle")?;
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .context("no cache folder")?;
-    let items = clip::unpack(&files, &cache.join("baton-pass/clipboard"))?;
+    let items = clip::unpack(&files, &crate::config::xdg_dir("XDG_CACHE_HOME", ".cache").join("clipboard"))?;
     let uris: Vec<String> = items.iter().map(|item| clip::file_uri(item)).collect();
     let paths: Vec<String> = items.iter().map(|item| item.display().to_string()).collect();
     let bytes = |text: String| copy::Source::Bytes(text.into_bytes().into_boxed_slice());
@@ -195,16 +195,8 @@ pub async fn exchange(cipher: &Cipher, peer: SocketAddr, frame: Vec<u8>, token: 
     tokio::time::timeout(TIMEOUT, async {
         let mut stream = TcpStream::connect(peer).await.context("connecting to the Mac")?;
         stream.set_nodelay(true)?;
-        stream.write_all(&(frame.len() as u32).to_le_bytes()).await?;
-        stream.write_all(&frame).await?;
-        let mut length = [0u8; 4];
-        stream.read_exact(&mut length).await?;
-        let length = u32::from_le_bytes(length) as usize;
-        if length > MAX_CLIPBOARD + 1024 {
-            bail!("oversized reply");
-        }
-        let mut reply = vec![0u8; length];
-        stream.read_exact(&mut reply).await?;
+        write_frame(&mut stream, &frame).await?;
+        let reply = read_frame(&mut stream, MAX_CLIPBOARD_FRAME).await?;
         let envelope = cipher
             .open(&reply)
             .and_then(|plain| Envelope::decode(&plain))

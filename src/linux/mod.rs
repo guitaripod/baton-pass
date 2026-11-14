@@ -371,7 +371,7 @@ impl Daemon {
         let just_returned = self.last_release.is_some_and(|at| at.elapsed() < BOUNCE_GUARD);
         if toggled.is_none() && (!self.config.edge || just_returned) {
             let inset = if just_returned { RETURN_INSET } else { 1.0 };
-            let back = portal::edge_point(edge.region, side, portal::edge_fraction(edge.region, side, entry.0, entry.1), inset);
+            let back = portal::back_point(edge.region, side, entry, inset);
             if let Err(error) = portal.release(activated.activation_id(), back).await {
                 self.session_lost = Some(format!("releasing an edge crossing failed: {error:#}"));
             }
@@ -393,7 +393,7 @@ impl Daemon {
         if !self.link.connected() {
             capture.return_to = None;
             self.capture = Some(capture);
-            let back = portal::edge_point(edge.region, side, portal::edge_fraction(edge.region, side, entry.0, entry.1), 1.0);
+            let back = portal::back_point(edge.region, side, entry, 1.0);
             self.release(back, "the Mac is not linked").await;
             return;
         }
@@ -449,8 +449,7 @@ impl Daemon {
             EiEvent::KeyboardKey(key) => {
                 let pressed = key.state == EiKeyState::Press;
                 if pressed && self.hotkey.matches(key.key, &capture.pressed) {
-                    let target = capture.return_to;
-                    let target = target.unwrap_or_else(|| self.return_point());
+                    let target = self.return_target();
                     self.release(target, "hotkey").await;
                     return;
                 }
@@ -521,9 +520,13 @@ impl Daemon {
     /// Where the cursor returns when the capture ends without an edge crossing on the Mac.
     fn return_point(&self) -> (f64, f64) {
         let Some(capture) = &self.capture else { return (0.0, 0.0) };
-        let side = self.config.side;
-        let frac = portal::edge_fraction(capture.edge.region, side, capture.entry.0, capture.entry.1);
-        portal::edge_point(capture.edge.region, side, frac, RETURN_INSET)
+        portal::back_point(capture.edge.region, self.config.side, capture.entry, RETURN_INSET)
+    }
+
+    /// Where the cursor returns from a hotkey or failsafe release: where it was when the hotkey
+    /// started the capture, or else back at the edge it crossed.
+    fn return_target(&self) -> (f64, f64) {
+        self.capture.as_ref().and_then(|capture| capture.return_to).unwrap_or_else(|| self.return_point())
     }
 
     async fn release(&mut self, target: (f64, f64), reason: &str) {
@@ -569,11 +572,7 @@ impl Daemon {
 
     async fn on_toggle(&mut self, position: Option<(f64, f64)>) {
         if self.capture.is_some() {
-            let target = self
-                .capture
-                .as_ref()
-                .and_then(|capture| capture.return_to)
-                .unwrap_or_else(|| self.return_point());
+            let target = self.return_target();
             self.release(target, "toggle").await;
             return;
         }
@@ -668,11 +667,7 @@ impl Daemon {
         let silent = self.capture.as_ref().is_some_and(|capture| capture.since.elapsed() > FAILSAFE)
             && self.link.quiet() > FAILSAFE;
         if self.capture.is_some() && (!connected || silent) {
-            let target = self
-                .capture
-                .as_ref()
-                .and_then(|capture| capture.return_to)
-                .unwrap_or_else(|| self.return_point());
+            let target = self.return_target();
             self.release(target, "the Mac stopped answering").await;
             self.note_hiccup("the Mac stopped answering; input came back here".into());
             self.notify("Lost the Mac", "Mouse and keyboard are back on this desktop");

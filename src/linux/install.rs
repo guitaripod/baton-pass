@@ -1,3 +1,4 @@
+use super::control::OBJECT_PATH;
 use super::keymap::Hotkey;
 use crate::config::Config;
 use crate::crypto;
@@ -5,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-pub const APP_ID: &str = "dev.batonpass.BatonPass";
+pub const APP_ID: &str = super::control::BUS_NAME;
 const SCRIPT_ID: &str = "batonpass";
 
 pub async fn install(peers: Vec<String>) -> Result<()> {
@@ -68,27 +69,32 @@ async fn run(program: &str, args: &[&str]) -> Result<()> {
 async fn load_kwin_script(main_script: &Path) -> Result<()> {
     run("kwriteconfig6", &["--file", "kwinrc", "--group", "Plugins", "--key", &format!("{SCRIPT_ID}Enabled"), "true"]).await?;
     let connection = zbus::Connection::session().await?;
-    let scripting = |method: &'static str| (Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), method);
-    let (destination, path, interface, method) = scripting("unloadScript");
-    let _ = connection.call_method(destination, path, interface, method, &(SCRIPT_ID,)).await;
-    let (destination, path, interface, method) = scripting("loadScript");
+    let scripting = KdeService { name: "org.kde.KWin", path: "/Scripting", interface: "org.kde.kwin.Scripting" };
+    let _ = scripting.call(&connection, "unloadScript", &(SCRIPT_ID,)).await;
     let path_text = main_script.to_string_lossy().to_string();
-    connection
-        .call_method(destination, path, interface, method, &(path_text.as_str(), SCRIPT_ID))
-        .await
-        .context("loading the KWin script")?;
-    let (destination, path, interface, method) = scripting("start");
-    connection.call_method(destination, path, interface, method, &()).await.context("starting KWin scripts")?;
-    let (destination, path, interface, method) = scripting("isScriptLoaded");
-    let loaded: bool = connection
-        .call_method(destination, path, interface, method, &(SCRIPT_ID,))
-        .await?
-        .body()
-        .deserialize()?;
+    scripting.call(&connection, "loadScript", &(path_text.as_str(), SCRIPT_ID)).await.context("loading the KWin script")?;
+    scripting.call(&connection, "start", &()).await.context("starting KWin scripts")?;
+    let loaded: bool = scripting.call(&connection, "isScriptLoaded", &(SCRIPT_ID,)).await?.body().deserialize()?;
     if !loaded {
         bail!("KWin did not load the baton-pass script");
     }
     Ok(())
+}
+
+/// A KDE D-Bus object to call methods on.
+struct KdeService {
+    name: &'static str,
+    path: &'static str,
+    interface: &'static str,
+}
+
+impl KdeService {
+    async fn call<B>(&self, connection: &zbus::Connection, method: &str, body: &B) -> zbus::Result<zbus::message::Message>
+    where
+        B: serde::Serialize + zbus::DynamicType,
+    {
+        connection.call_method(Some(self.name), self.path, Some(self.interface), method, body).await
+    }
 }
 
 fn peers_line(peers: &[String]) -> String {
@@ -122,27 +128,23 @@ fn with_peers(config: &str, peers: &[String]) -> String {
 async fn claim_shortcut(hotkey: &Hotkey) -> Result<()> {
     let Some(combination) = hotkey.qt_combination() else { return Ok(()) };
     let connection = zbus::Connection::session().await?;
-    let call = |method: &'static str| (Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), method);
-    let (destination, path, interface, method) = call("getGlobalShortcutsByKey");
+    let accel = KdeService { name: "org.kde.kglobalaccel", path: "/kglobalaccel", interface: "org.kde.KGlobalAccel" };
     type Owner = (String, String, String, String, String, String, Vec<i32>, Vec<i32>);
-    let owners: Vec<Owner> =
-        connection.call_method(destination, path, interface, method, &(combination,)).await?.body().deserialize()?;
+    let owners: Vec<Owner> = accel.call(&connection, "getGlobalShortcutsByKey", &(combination,)).await?.body().deserialize()?;
     for (unique, friendly, component, component_friendly, ..) in owners {
         if component == "kwin" && unique == "BatonPassToggle" {
             continue;
         }
-        let (destination, path, interface, method) = call("setShortcutKeys");
         let action = vec![component.clone(), unique.clone(), component_friendly, friendly.clone()];
-        connection
-            .call_method(destination, path, interface, method, &(action, Vec::<(Vec<i32>,)>::new(), 4u32))
+        accel
+            .call(&connection, "setShortcutKeys", &(action, Vec::<(Vec<i32>,)>::new(), 4u32))
             .await
             .with_context(|| format!("unbinding {} from {friendly}", hotkey.qt_name()))?;
         println!("took {} from \"{friendly}\" ({component})", hotkey.qt_name());
     }
-    let (destination, path, interface, method) = call("setShortcutKeys");
     let ours = vec!["kwin".to_string(), "BatonPassToggle".into(), "KWin".into(), "Baton Pass: Carry Mouse and Keyboard to the Mac".into()];
-    connection
-        .call_method(destination, path, interface, method, &(ours, vec![(vec![combination, 0, 0, 0],)], 4u32))
+    accel
+        .call(&connection, "setShortcutKeys", &(ours, vec![(vec![combination, 0, 0, 0],)], 4u32))
         .await
         .context("binding the hotkey")?;
     Ok(())
@@ -204,7 +206,7 @@ fn kwin_script(shortcut: &str) -> String {
     format!(
         r#"registerShortcut("BatonPassToggle", "Baton Pass: Carry Mouse and Keyboard to the Mac", "{shortcut}", function () {{
     const position = workspace.cursorPos;
-    callDBus("{APP_ID}", "/dev/batonpass/BatonPass", "{APP_ID}", "Toggle", String(position.x), String(position.y));
+    callDBus("{APP_ID}", "{OBJECT_PATH}", "{APP_ID}", "Toggle", String(position.x), String(position.y));
 }});
 "#
     )
@@ -225,5 +227,6 @@ mod tests {
     #[test]
     fn shortcut_is_escaped_for_javascript() {
         assert!(kwin_script("Meta+\\").contains("\"Meta+\\\\\""));
+        assert!(kwin_script("Meta+Esc").contains("\"/dev/batonpass/BatonPass\""));
     }
 }

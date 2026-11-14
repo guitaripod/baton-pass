@@ -41,13 +41,6 @@ pub enum Admission {
 }
 
 #[cfg(any(target_os = "macos", test))]
-impl Default for Doorman {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
 impl Doorman {
     pub fn new() -> Self {
         Self { token: None, peer: None, challenge: None, counter: 0, last_reset: None }

@@ -54,18 +54,13 @@ pub async fn notify(connection: &zbus::Connection, summary: &str, body: &str) {
     }
 }
 
-async fn call(method: &str, body: &(&str, &str)) -> Result<zbus::message::Message> {
+async fn call<B>(method: &str, body: &B) -> Result<zbus::message::Message>
+where
+    B: serde::Serialize + zbus::DynamicType,
+{
     let connection = zbus::Connection::session().await?;
     connection
         .call_method(Some(BUS_NAME), OBJECT_PATH, Some(BUS_NAME), method, body)
-        .await
-        .context("baton-pass is not running (systemctl --user status baton-pass)")
-}
-
-async fn call_unit(method: &str) -> Result<zbus::message::Message> {
-    let connection = zbus::Connection::session().await?;
-    connection
-        .call_method(Some(BUS_NAME), OBJECT_PATH, Some(BUS_NAME), method, &())
         .await
         .context("baton-pass is not running (systemctl --user status baton-pass)")
 }
@@ -76,7 +71,7 @@ pub async fn toggle() -> Result<()> {
 }
 
 pub async fn status() -> Result<()> {
-    let reply = call_unit("Status").await?;
+    let reply = call("Status", &()).await?;
     let text: String = reply.body().deserialize()?;
     println!("{text}");
     Ok(())

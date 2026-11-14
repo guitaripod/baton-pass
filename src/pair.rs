@@ -3,12 +3,12 @@
 //! wrong guess ends the pairing window on the Mac.
 
 use crate::crypto::{self, Cipher};
+use crate::proto;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub const PORT: u16 = 47475;
@@ -100,18 +100,15 @@ pub async fn on_mac() -> Result<()> {
 /// service on the new key.
 #[cfg(target_os = "linux")]
 pub async fn on_desktop(code: &str, peer: Option<String>) -> Result<()> {
-    let host = match peer {
+    let peer = match peer {
         Some(peer) => peer,
-        None => {
-            let config = crate::config::Config::load()?;
-            let first = config.peers.first().context("no peers configured; pass --peer <mac address>")?.clone();
-            first.rsplit_once(':').filter(|(_, port)| port.parse::<u16>().is_ok()).map_or(first.clone(), |(host, _)| host.to_string())
-        }
+        None => crate::config::Config::load()?.peers.first().context("no peers configured; pass --peer <mac address>")?.clone(),
     };
+    let address = crate::config::with_port(&peer, PORT);
     let key_path = crate::config::Config::key_path();
-    join(&format!("{host}:{PORT}"), code, &key_path).await?;
+    join(&address, code, &key_path).await?;
     let _ = tokio::process::Command::new("systemctl").args(["--user", "try-restart", "baton-pass.service"]).status().await;
-    println!("Paired with the Mac at {host}; the key is in {}", key_path.display());
+    println!("Paired with the Mac at {address}; the key is in {}", key_path.display());
     Ok(())
 }
 
@@ -124,29 +121,12 @@ fn session_cipher(shared: Vec<u8>) -> Cipher {
 }
 
 async fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> Result<()> {
-    tokio::time::timeout(STEP_TIMEOUT, async {
-        stream.write_all(&(frame.len() as u32).to_le_bytes()).await?;
-        stream.write_all(frame).await
-    })
-    .await
-    .context("pairing timed out")??;
+    tokio::time::timeout(STEP_TIMEOUT, proto::write_frame(stream, frame)).await.context("pairing timed out")??;
     Ok(())
 }
 
 async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    tokio::time::timeout(STEP_TIMEOUT, async {
-        let mut length = [0u8; 4];
-        stream.read_exact(&mut length).await?;
-        let length = u32::from_le_bytes(length) as usize;
-        if length > MAX_FRAME {
-            bail!("oversized pairing message");
-        }
-        let mut frame = vec![0u8; length];
-        stream.read_exact(&mut frame).await?;
-        Ok(frame)
-    })
-    .await
-    .context("pairing timed out")?
+    tokio::time::timeout(STEP_TIMEOUT, proto::read_frame(stream, MAX_FRAME)).await.context("pairing timed out")?
 }
 
 #[cfg(test)]

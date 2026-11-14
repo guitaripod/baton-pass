@@ -17,7 +17,7 @@ pub struct Cipher(XChaCha20Poly1305);
 impl Cipher {
     pub fn load(path: &Path) -> Result<Self> {
         let metadata = std::fs::metadata(path)
-            .with_context(|| format!("reading key {} (run `baton-pass keygen`)", path.display()))?;
+            .with_context(|| format!("reading key {} (pair the machines: `sudo baton-pass pair` on the Mac, then `baton-pass pair <code>` on the desktop)", path.display()))?;
         if metadata.permissions().mode() & 0o077 != 0 {
             bail!("{} must not be readable by group or others (chmod 600)", path.display());
         }
@@ -55,6 +55,7 @@ impl Cipher {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn ensure_key(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -62,6 +63,7 @@ pub fn ensure_key(path: &Path) -> Result<()> {
     write_key(path, &random_key())
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub fn random_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).expect("system randomness");

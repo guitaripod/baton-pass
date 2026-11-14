@@ -1,7 +1,7 @@
 //! The clipboard as Baton Pass carries it between the machines: every format the copying app
 //! offered that the other side understands, plus copied files as one bundle.
 
-use crate::proto::MAX_CLIPBOARD;
+use crate::proto::{MAX_CLIPBOARD, Reader, put_blob as put};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::os::unix::ffi::OsStringExt;
@@ -215,40 +215,6 @@ pub fn file_uri(path: &Path) -> String {
         }
     }
     uri
-}
-
-fn put(out: &mut Vec<u8>, data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    out.extend_from_slice(data);
-}
-
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
-        if self.0.len() < count {
-            return None;
-        }
-        let (head, tail) = self.0.split_at(count);
-        self.0 = tail;
-        Some(head)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn blob(&mut self) -> Option<&'a [u8]> {
-        let length = self.u32()? as usize;
-        if length > MAX_CLIPBOARD {
-            return None;
-        }
-        self.take(length)
-    }
 }
 
 #[cfg(test)]

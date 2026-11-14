@@ -2,8 +2,6 @@ use crate::clip::Clip;
 pub const MAX_KEYS: usize = 32;
 pub const MAX_CLIPBOARD: usize = 32 * 1024 * 1024;
 
-#[cfg(target_os = "macos")]
-pub const FLAG_VHID_CONNECTED: u8 = 1;
 pub const FLAG_KEYBOARD_READY: u8 = 2;
 pub const FLAG_POINTING_READY: u8 = 4;
 pub const FLAG_VERSION_MISMATCH: u8 = 8;
@@ -154,9 +152,9 @@ impl Envelope {
             },
             8 => Msg::Keys(reader.keys()?),
             9 => Msg::Exit { frac: reader.f32()? },
-            16 => Msg::ClipPut { clip: crate::clip::decode(&reader.blob()?)? },
+            16 => Msg::ClipPut { clip: crate::clip::decode(reader.blob()?)? },
             11 => Msg::ClipGet { have: reader.take(32)?.try_into().ok()? },
-            17 => Msg::ClipData { echo: reader.u64()?, clip: crate::clip::decode(&reader.blob()?)? },
+            17 => Msg::ClipData { echo: reader.u64()?, clip: crate::clip::decode(reader.blob()?)? },
             13 => Msg::ClipNone { echo: reader.u64()? },
             14 => Msg::Challenge { nonce: reader.u64()?, challenge: reader.u64()? },
             15 => Msg::Join { nonce: reader.u64()?, challenge: reader.u64()? },
@@ -177,15 +175,40 @@ fn put_keys(out: &mut Vec<u8>, keys: &KeyState) {
     }
 }
 
-fn put_blob(out: &mut Vec<u8>, data: &[u8]) {
+pub(crate) fn put_blob(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out.extend_from_slice(data);
 }
 
-struct Reader<'a>(&'a [u8]);
+/// The largest clipboard frame on the TCP exchange: a whole clipboard plus envelope overhead.
+pub const MAX_CLIPBOARD_FRAME: usize = MAX_CLIPBOARD + 1024;
 
-impl Reader<'_> {
-    fn take(&mut self, count: usize) -> Option<&[u8]> {
+/// Writes one frame to a stream: its length as four little-endian bytes, then the bytes.
+pub async fn write_frame<S: tokio::io::AsyncWrite + Unpin>(stream: &mut S, frame: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(&(frame.len() as u32).to_le_bytes()).await?;
+    stream.write_all(frame).await
+}
+
+/// Reads one frame written by `write_frame`, refusing any longer than `max` bytes.
+pub async fn read_frame<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, max: usize) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).await?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length > max {
+        anyhow::bail!("oversized frame ({length} bytes)");
+    }
+    let mut frame = vec![0u8; length];
+    stream.read_exact(&mut frame).await?;
+    Ok(frame)
+}
+
+/// Reads little-endian fields and length-prefixed blobs off the front of a buffer.
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
+
+impl<'a> Reader<'a> {
+    pub(crate) fn take(&mut self, count: usize) -> Option<&'a [u8]> {
         if self.0.len() < count {
             return None;
         }
@@ -194,7 +217,7 @@ impl Reader<'_> {
         Some(head)
     }
 
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
 
@@ -202,7 +225,7 @@ impl Reader<'_> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
 
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
@@ -230,14 +253,13 @@ impl Reader<'_> {
         Some(KeyState { modifiers: self.u8()?, keys: self.usages()?, consumer: self.usages()? })
     }
 
-    fn blob(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn blob(&mut self) -> Option<&'a [u8]> {
         let length = self.u32()? as usize;
         if length > MAX_CLIPBOARD {
             return None;
         }
-        Some(self.take(length)?.to_vec())
+        self.take(length)
     }
-
 }
 
 #[cfg(test)]
