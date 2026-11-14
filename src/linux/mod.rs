@@ -42,6 +42,9 @@ const BOUNCE_GUARD: Duration = Duration::from_millis(400);
 const STRAY_PERSIST: Duration = Duration::from_millis(250);
 const STRAY_GAP: Duration = Duration::from_millis(150);
 const STRAY_ESCALATE: Duration = Duration::from_secs(4);
+const PORTAL_TIMEOUT: Duration = Duration::from_secs(1);
+const SLOW_HANDLER: Duration = Duration::from_millis(50);
+const LATE_TICK: Duration = Duration::from_millis(150);
 
 struct Capture {
     activation_id: Option<u32>,
@@ -92,6 +95,7 @@ struct Daemon {
     last_release: Option<Instant>,
     last_stray_release: Option<Instant>,
     stray: Option<(Instant, Instant)>,
+    last_tick: Option<Instant>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -130,6 +134,7 @@ pub async fn run(config: Config) -> Result<()> {
         last_release: None,
         last_stray_release: None,
         stray: None,
+        last_tick: None,
     };
     let mut ei: Option<Ei> = None;
     let mut streams = Streams::default();
@@ -145,24 +150,38 @@ pub async fn run(config: Config) -> Result<()> {
     loop {
         tokio::select! {
             received = daemon.link.recv(&mut buffer) => match received {
-                Ok((length, from)) => daemon.on_datagram(&buffer[..length], from).await,
+                Ok((length, from)) => {
+                    let started = Instant::now();
+                    daemon.on_datagram(&buffer[..length], from).await;
+                    report_slow("handling a datagram", started);
+                }
                 Err(error) => tracing::debug!("udp receive: {error}"),
             },
             event = next_ei(&mut ei) => match event {
                 Some(Ok(event)) => {
+                    let started = Instant::now();
                     if let Some(ei) = &ei {
                         ei.bind_seat(&event);
                     }
                     daemon.on_ei(event).await;
+                    report_slow("handling an input event", started);
                 }
                 other => daemon.session_lost = Some(format!("the input capture connection ended: {other:?}")),
             },
             activated = next_signal(&mut streams.activated) => match activated {
-                Some(activated) => daemon.on_activated(activated).await,
+                Some(activated) => {
+                    let started = Instant::now();
+                    daemon.on_activated(activated).await;
+                    report_slow("starting a capture", started);
+                }
                 None => daemon.session_lost = Some("portal signals stopped".into()),
             },
             deactivated = next_signal(&mut streams.deactivated) => match deactivated {
-                Some(deactivated) => daemon.on_deactivated(deactivated.activation_id()).await,
+                Some(deactivated) => {
+                    let started = Instant::now();
+                    daemon.on_deactivated(deactivated.activation_id()).await;
+                    report_slow("ending a capture", started);
+                }
                 None => daemon.session_lost = Some("portal signals stopped".into()),
             },
             disabled = next_signal(&mut streams.disabled) => match disabled {
@@ -208,7 +227,9 @@ pub async fn run(config: Config) -> Result<()> {
                     if daemon.portal.is_none() {
                         daemon.start_opening();
                     }
+                    let started = Instant::now();
                     daemon.on_toggle(position).await;
+                    report_slow("handling the hotkey", started);
                 }
                 Some(Request::Status(reply)) => {
                     let _ = reply.send(daemon.status());
@@ -216,11 +237,13 @@ pub async fn run(config: Config) -> Result<()> {
                 None => break,
             },
             _ = ticker.tick() => {
+                let started = Instant::now();
                 if daemon.reopen_at.is_some_and(|at| Instant::now() >= at) {
                     daemon.reopen_at = None;
                     daemon.start_opening();
                 }
                 daemon.tick().await;
+                report_slow("the periodic tick", started);
             }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
@@ -489,10 +512,13 @@ impl Daemon {
         self.last_release = Some(Instant::now());
         tracing::info!("released ({reason}) after {:.1} s", capture.since.elapsed().as_secs_f32());
         self.link.send(Msg::Leave).await;
-        if let Some(portal) = &self.portal
-            && let Err(error) = portal.release(capture.activation_id, target).await
-        {
-            self.session_lost = Some(format!("releasing the capture failed: {error:#}"));
+        self.heartbeat_soon();
+        if let Some(portal) = &self.portal {
+            match tokio::time::timeout(PORTAL_TIMEOUT, portal.release(capture.activation_id, target)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => self.session_lost = Some(format!("releasing the capture failed: {error:#}")),
+                Err(_) => self.session_lost = Some("the compositor did not answer the release".into()),
+            }
         }
         self.queue_clipboard(false);
     }
@@ -501,8 +527,14 @@ impl Daemon {
         if let Some(capture) = self.capture.take() {
             tracing::info!("capture ended ({reason}) after {:.1} s", capture.since.elapsed().as_secs_f32());
             self.link.send(Msg::Leave).await;
+            self.heartbeat_soon();
             self.queue_clipboard(false);
         }
+    }
+
+    /// Makes the next tick send a heartbeat, which repeats a just-sent Leave in case it was lost.
+    fn heartbeat_soon(&mut self) {
+        self.last_heartbeat = Instant::now() - HEARTBEAT_IDLE;
     }
 
     /// Ends the capture the compositor deactivated, ignoring a late signal for an earlier one.
@@ -527,16 +559,16 @@ impl Daemon {
             return;
         }
         if !self.link.connected() {
-            control::notify(&self.bus, "The Mac is not reachable", "ferry keeps looking for it").await;
+            self.notify("The Mac is not reachable", "ferry keeps looking for it");
             return;
         }
         self.arm().await;
         let Some(portal) = self.portal.as_ref().filter(|portal| portal.armed()) else {
-            control::notify(&self.bus, "Input capture is not ready", self.portal_error.as_deref().unwrap_or("")).await;
+            self.notify("Input capture is not ready", self.portal_error.as_deref().unwrap_or(""));
             return;
         };
         if self.slammer.is_none() {
-            control::notify(&self.bus, "Hotkey needs /dev/uinput", "Move the pointer past the edge instead").await;
+            self.notify("Hotkey needs /dev/uinput", "Move the pointer past the edge instead");
             return;
         }
         let plans = slam_plans(self.config.side, portal.edges(), position);
@@ -582,11 +614,40 @@ impl Daemon {
         self.link.send(Msg::Heartbeat { entered, keys, buttons }).await;
     }
 
+    /// Reads every datagram already waiting. Run before judging the Mac silent, so replies left
+    /// unread while this loop was busy are never mistaken for the Mac going quiet.
+    async fn drain_link(&mut self) {
+        let mut buffer = [0u8; 2048];
+        while let Ok((length, from)) = self.link.try_recv(&mut buffer) {
+            self.on_datagram(&buffer[..length], from).await;
+        }
+    }
+
+    /// Measures how long it has been since the last tick. Only the part a running loop would
+    /// take counts toward the Mac's silence; a longer gap means this loop was blocked, which is
+    /// logged, and a heartbeat goes out at once so the Mac hears from this side again.
+    async fn note_tick(&mut self) {
+        let now = Instant::now();
+        let gap = self.last_tick.replace(now).map_or(TICK, |at| now - at);
+        self.link.note_running(gap.min(TICK * 2));
+        if gap > LATE_TICK {
+            tracing::warn!("event loop stalled: {} ms between ticks", gap.as_millis());
+            if self.capture.is_some() && self.link.connected() {
+                self.heartbeat().await;
+            }
+        }
+    }
+
     async fn tick(&mut self) {
+        self.note_tick().await;
+        if self.link.last_heard.elapsed() > HEARTBEAT_CAPTURED * 2 {
+            self.drain_link().await;
+        }
         self.link.maintain().await;
         let connected = self.link.connected();
 
-        let silent = self.capture.as_ref().is_some_and(|capture| self.link.last_heard.max(capture.since).elapsed() > FAILSAFE);
+        let silent = self.capture.as_ref().is_some_and(|capture| capture.since.elapsed() > FAILSAFE)
+            && self.link.quiet() > FAILSAFE;
         if self.capture.is_some() && (!connected || silent) {
             let target = self
                 .capture
@@ -594,7 +655,7 @@ impl Daemon {
                 .and_then(|capture| capture.return_to)
                 .unwrap_or_else(|| self.return_point());
             self.release(target, "the Mac stopped answering").await;
-            control::notify(&self.bus, "Lost the Mac", "Mouse and keyboard are back on this desktop").await;
+            self.notify("Lost the Mac", "Mouse and keyboard are back on this desktop");
         }
 
         if !connected
@@ -619,13 +680,19 @@ impl Daemon {
         self.advance_toggle().await;
         if self.pending_toggle.as_ref().is_some_and(|toggle| toggle.started.elapsed() > TOGGLE_WINDOW) {
             self.pending_toggle = None;
-            control::notify(&self.bus, "Could not reach the edge", "Move the pointer past the edge instead").await;
+            self.notify("Could not reach the edge", "Move the pointer past the edge instead");
         }
 
         let interval = if self.capture.is_some() { HEARTBEAT_CAPTURED } else { HEARTBEAT_IDLE };
         if connected && self.last_heartbeat.elapsed() >= interval {
             self.heartbeat().await;
         }
+    }
+
+    /// Shows a desktop notification without waiting for the notification daemon to answer.
+    fn notify(&self, summary: &str, body: &str) {
+        let (bus, summary, body) = (self.bus.clone(), summary.to_string(), body.to_string());
+        tokio::task::spawn_local(async move { control::notify(&bus, &summary, &body).await });
     }
 
     /// Pushes this desktop's clipboard to the Mac on the way over, or pulls the Mac's on the way back.
@@ -696,6 +763,14 @@ impl Daemon {
         if let Some(portal) = &self.portal {
             portal.close().await;
         }
+    }
+}
+
+/// Logs a handler that held the event loop long enough to delay heartbeats and input.
+fn report_slow(what: &str, started: Instant) {
+    let took = started.elapsed();
+    if took > SLOW_HANDLER {
+        tracing::warn!("{what} held the event loop for {} ms", took.as_millis());
     }
 }
 

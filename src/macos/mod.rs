@@ -20,6 +20,7 @@ use tokio::signal::unix::{SignalKind, signal};
 const POLL_ENTERED: Duration = Duration::from_millis(4);
 const POLL_IDLE: Duration = Duration::from_millis(100);
 const SILENCE_LIMIT: Duration = Duration::from_millis(500);
+const LEAVE_LIMIT: Duration = Duration::from_secs(3);
 const DISPLAY_REFRESH: Duration = Duration::from_secs(1);
 const EXIT_RESEND: Duration = Duration::from_millis(30);
 const PUSH_MEMORY: Duration = Duration::from_millis(60);
@@ -28,6 +29,8 @@ const CALIBRATION_REPORTS: i32 = 2;
 const RATIO_SAMPLES: usize = 7;
 const RATIO_SHIFT: f64 = 0.12;
 const NUDGE_SETTLE: Duration = Duration::from_millis(20);
+const SLOW_HANDLER: Duration = Duration::from_millis(50);
+const LATE_TICK: Duration = Duration::from_millis(150);
 const PARKING_LIMIT: Duration = Duration::from_millis(500);
 const CHALLENGE_LIFETIME: Duration = Duration::from_secs(5);
 const EXIT_ARM_DISTANCE: f64 = 24.0;
@@ -54,7 +57,10 @@ struct Receiver {
     gate: Rc<RefCell<Gate>>,
     confine: Confine,
     udp_counter: u64,
-    last_heard: Instant,
+    quiet: Duration,
+    quiet_released: bool,
+    last_tick: Option<Instant>,
+    watcher: display::Watcher,
     last_reset: Instant,
     challenge: Option<(u64, SocketAddr, Instant)>,
     entered: bool,
@@ -98,7 +104,10 @@ pub async fn run(config: Config) -> Result<()> {
         gate: gate.clone(),
         confine: config.confine,
         udp_counter: 0,
-        last_heard: Instant::now(),
+        quiet: Duration::ZERO,
+        quiet_released: false,
+        last_tick: None,
+        watcher: display::Watcher::start(DISPLAY_REFRESH),
         last_reset: Instant::now() - Duration::from_secs(1),
         challenge: None,
         entered: false,
@@ -134,7 +143,11 @@ pub async fn run(config: Config) -> Result<()> {
         next_tick = next_tick.min(tokio::time::Instant::now() + poll);
         tokio::select! {
             received = receiver.socket.recv_from(&mut buffer) => match received {
-                Ok((length, from)) => receiver.on_datagram(&buffer[..length], from).await,
+                Ok((length, from)) => {
+                    let started = Instant::now();
+                    receiver.on_datagram(&buffer[..length], from).await;
+                    report_slow("handling a datagram", started);
+                }
                 Err(error) => tracing::debug!("udp receive: {error}"),
             },
             accepted = listener.accept() => match accepted {
@@ -149,7 +162,13 @@ pub async fn run(config: Config) -> Result<()> {
                 Err(error) => tracing::debug!("tcp accept: {error}"),
             },
             _ = tokio::time::sleep_until(next_tick) => {
+                let late = tokio::time::Instant::now().saturating_duration_since(next_tick);
+                if late > LATE_TICK {
+                    tracing::warn!("event loop stalled: tick ran {} ms late", late.as_millis());
+                }
+                let started = Instant::now();
                 receiver.tick().await;
+                report_slow("the periodic tick", started);
                 next_tick = tokio::time::Instant::now() + receiver.poll_interval();
             }
             _ = terminate.recv() => break,
@@ -196,7 +215,7 @@ impl Receiver {
                     gate.tcp_counter = 0;
                 }
                 self.udp_counter = envelope.counter;
-                self.last_heard = Instant::now();
+                self.heard();
                 self.leave("new session");
                 tracing::info!("session with {from}");
                 self.reply(from, 0, Msg::Welcome { nonce, token }).await;
@@ -219,7 +238,7 @@ impl Receiver {
             return;
         }
         self.udp_counter = envelope.counter;
-        self.last_heard = Instant::now();
+        self.heard();
         let token = envelope.token;
         match envelope.msg {
             Msg::Heartbeat { entered, keys, buttons } => {
@@ -450,11 +469,50 @@ impl Receiver {
         }
     }
 
-    async fn tick(&mut self) {
-        self.settle_parking();
-        if self.entered && self.last_heard.elapsed() > SILENCE_LIMIT {
-            self.leave("the desktop went quiet");
+    /// Reads every datagram already waiting. Run before judging the desktop silent, so packets
+    /// left unread while this loop was busy are never mistaken for the desktop going quiet.
+    async fn drain(&mut self) {
+        let mut buffer = [0u8; 2048];
+        while let Ok((length, from)) = self.socket.try_recv_from(&mut buffer) {
+            self.on_datagram(&buffer[..length], from).await;
         }
+    }
+
+    fn heard(&mut self) {
+        self.quiet = Duration::ZERO;
+        self.quiet_released = false;
+    }
+
+    /// Counts the time since the last tick toward the desktop's silence, but only as much as a
+    /// running loop would take: time this loop spent blocked is not the desktop's fault.
+    fn note_tick(&mut self) {
+        let now = Instant::now();
+        let bound = self.poll_interval() * 2;
+        let gap = self.last_tick.replace(now).map_or(Duration::ZERO, |at| now - at);
+        self.quiet += gap.min(bound);
+    }
+
+    /// A short silence only lets go of held keys and buttons, so nothing repeats or drags on its
+    /// own; control stays here and carries on with the next packet. Only a long silence, the
+    /// desktop gone for good, gives control up.
+    async fn check_silence(&mut self) {
+        if !self.entered || self.quiet <= SILENCE_LIMIT {
+            return;
+        }
+        self.drain().await;
+        if self.quiet > LEAVE_LIMIT {
+            self.leave("the desktop went quiet");
+        } else if self.quiet > SILENCE_LIMIT && !self.quiet_released {
+            self.quiet_released = true;
+            self.release_all();
+            tracing::info!("desktop quiet for {} ms; keys released, still in control", self.quiet.as_millis());
+        }
+    }
+
+    async fn tick(&mut self) {
+        self.note_tick();
+        self.settle_parking();
+        self.check_silence().await;
         let ready = vhid::pointing_ready();
         if ready != self.pointer_was_ready {
             self.pointer_was_ready = ready;
@@ -504,7 +562,7 @@ impl Receiver {
             return;
         }
         self.displays_at = Some(Instant::now());
-        let online = display::online();
+        let online = if force { display::online() } else { self.watcher.latest() };
         let builtin: Vec<Rect> = online.iter().filter(|d| d.builtin).map(|d| d.bounds).collect();
         self.displays = match self.confine {
             Confine::Builtin if !builtin.is_empty() => builtin,
@@ -573,6 +631,14 @@ impl Receiver {
         self.points_per_count = Some(ratio);
         self.ratio_samples.clear();
         self.recalibrate = false;
+    }
+}
+
+/// Logs a handler that held the event loop long enough to delay input and replies.
+fn report_slow(what: &str, started: Instant) {
+    let took = started.elapsed();
+    if took > SLOW_HANDLER {
+        tracing::warn!("{what} held the event loop for {} ms", took.as_millis());
     }
 }
 

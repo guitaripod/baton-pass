@@ -1,6 +1,7 @@
 use crate::crypto::{Cipher, Counter, random_u64};
 use crate::proto::{Envelope, Msg};
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -9,6 +10,7 @@ use tokio::net::UdpSocket;
 const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const NONCE_MEMORY: usize = 4;
+const SEND_WARNING_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The encrypted UDP session with the Mac: handshake, replay protection and liveness.
 pub struct Link {
@@ -25,6 +27,9 @@ pub struct Link {
     peer_counter: u64,
     session_floor: u64,
     pub last_heard: Instant,
+    quiet: Duration,
+    resolved: Rc<RefCell<HashMap<String, SocketAddr>>>,
+    last_send_warning: Option<Instant>,
     pub flags: u8,
 }
 
@@ -50,6 +55,9 @@ impl Link {
             peer_counter: 0,
             session_floor: 0,
             last_heard: Instant::now(),
+            quiet: Duration::ZERO,
+            resolved: Rc::new(RefCell::new(HashMap::new())),
+            last_send_warning: None,
             flags: 0,
         })
     }
@@ -73,10 +81,29 @@ impl Link {
         self.joining = None;
     }
 
+    /// Counts `running` (time this daemon's loop was actually running) toward the Mac's
+    /// silence. Time the loop spent blocked is left out, so a stall here is never blamed on the
+    /// Mac: the heartbeats it would have answered were never sent.
+    pub fn note_running(&mut self, running: Duration) {
+        if self.connected() {
+            self.quiet += running;
+        }
+    }
+
+    /// How long the Mac has been silent while this loop was running to hear it.
+    pub fn quiet(&self) -> Duration {
+        self.quiet
+    }
+
+    fn heard(&mut self) {
+        self.last_heard = Instant::now();
+        self.quiet = Duration::ZERO;
+    }
+
     /// Greets one configured peer per interval, in order, so the wired address wins whenever it
     /// answers and the tailnet name is only a fallback; drops a session that went silent.
     pub async fn maintain(&mut self) {
-        if self.connected() && self.last_heard.elapsed() > IDLE_TIMEOUT {
+        if self.connected() && self.quiet > IDLE_TIMEOUT {
             self.disconnect("no reply for 3 s");
         }
         if self.connected() || self.last_hello.is_some_and(|sent| sent.elapsed() < HELLO_INTERVAL) {
@@ -94,22 +121,44 @@ impl Link {
         let peer = self.peers[self.next_peer % self.peers.len()].clone();
         self.next_peer = (self.next_peer + 1) % self.peers.len();
         let packet = self.seal(0, Msg::Hello { nonce });
-        match tokio::net::lookup_host(&peer).await {
-            Ok(mut addresses) => {
-                if let Some(address) = addresses.find(SocketAddr::is_ipv4)
-                    && let Err(error) = self.socket.send_to(&packet, address).await {
-                        tracing::debug!("hello to {address}: {error}");
-                    }
-            }
-            Err(error) => tracing::debug!("resolving {peer}: {error}"),
+        if let Some(address) = self.address_of(&peer)
+            && let Err(error) = self.socket.send_to(&packet, address).await
+        {
+            tracing::debug!("hello to {address}: {error}");
         }
+    }
+
+    /// The address for a configured peer. Literal addresses are used as they are; names are
+    /// resolved by a background task and used from the next greeting on, so a slow resolver
+    /// never holds the daemon's loop.
+    fn address_of(&self, peer: &str) -> Option<SocketAddr> {
+        if let Ok(address) = peer.parse::<SocketAddr>() {
+            return Some(address);
+        }
+        let cached = self.resolved.borrow().get(peer).copied();
+        let resolved = self.resolved.clone();
+        let name = peer.to_string();
+        tokio::task::spawn_local(async move {
+            let found = tokio::net::lookup_host(name.as_str()).await.map(|mut addresses| addresses.find(SocketAddr::is_ipv4));
+            match found {
+                Ok(Some(address)) => {
+                    resolved.borrow_mut().insert(name, address);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::debug!("resolving {name}: {error}"),
+            }
+        });
+        cached
     }
 
     pub async fn send(&mut self, msg: Msg) {
         let (Some(token), Some(peer)) = (self.token, self.peer) else { return };
         let packet = self.seal(token, msg);
-        if let Err(error) = self.socket.send_to(&packet, peer).await {
-            tracing::debug!("send to {peer}: {error}");
+        if let Err(error) = self.socket.send_to(&packet, peer).await
+            && self.last_send_warning.is_none_or(|at| at.elapsed() > SEND_WARNING_INTERVAL)
+        {
+            self.last_send_warning = Some(Instant::now());
+            tracing::warn!("sending to the Mac at {peer} failed: {error}");
         }
     }
 
@@ -120,6 +169,10 @@ impl Link {
 
     pub async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         self.socket.recv_from(buffer).await
+    }
+
+    pub fn try_recv(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.socket.try_recv_from(buffer)
     }
 
     /// Authenticates a datagram and applies the session rules; returns what the daemon must act on.
@@ -141,7 +194,7 @@ impl Link {
                 self.peer = Some(from);
                 self.peer_counter = envelope.counter;
                 self.session_floor = self.counter.peek();
-                self.last_heard = Instant::now();
+                self.heard();
                 self.nonces.clear();
                 self.joining = None;
                 tracing::info!("linked with the Mac at {from}");
@@ -165,7 +218,7 @@ impl Link {
                     return None;
                 }
                 self.peer_counter = envelope.counter;
-                self.last_heard = Instant::now();
+                self.heard();
                 Some(Incoming::Message(msg))
             }
         }

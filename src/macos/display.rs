@@ -82,6 +82,37 @@ pub struct Display {
     pub builtin: bool,
 }
 
+/// Keeps a fresh copy of `online()` from a background thread, so the receive loop never waits
+/// on WindowServer for the display list (it can be slow to answer while an external display's
+/// link is retraining).
+pub struct Watcher {
+    latest: std::sync::Arc<std::sync::Mutex<Vec<Display>>>,
+}
+
+impl Watcher {
+    pub fn start(interval: std::time::Duration) -> Self {
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(online()));
+        let shared = latest.clone();
+        let spawned = std::thread::Builder::new().name("ferry-displays".into()).spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                let displays = online();
+                if let Ok(mut latest) = shared.lock() {
+                    *latest = displays;
+                }
+            }
+        });
+        if let Err(error) = spawned {
+            tracing::warn!("display watcher thread: {error}");
+        }
+        Self { latest }
+    }
+
+    pub fn latest(&self) -> Vec<Display> {
+        self.latest.lock().map(|latest| latest.clone()).unwrap_or_default()
+    }
+}
+
 /// Every non-mirroring display, in global points with the origin at the main display's top left.
 /// Sleep state is not consulted: outside the GUI session macOS reports every display as asleep,
 /// and the first injected movement wakes a sleeping one anyway.

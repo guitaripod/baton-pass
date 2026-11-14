@@ -52,12 +52,13 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    let (log_writer, _log_flush) = tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(log_writer)
         .with_ansi(false)
         .init();
 
