@@ -39,9 +39,9 @@ extern "C" void ferry_vhid_start(uint16_t vendor_id, uint16_t product_id, uint8_
   pqrs::dispatcher::extra::initialize_shared_dispatcher();
   client = new service::client();
 
-  service::virtual_hid_keyboard_parameters parameters(pqrs::hid::vendor_id::value_t(vendor_id),
+  service::virtual_hid_keyboard_parameters parameters{pqrs::hid::vendor_id::value_t(vendor_id),
                                                       pqrs::hid::product_id::value_t(product_id),
-                                                      pqrs::hid::country_code::value_t(country_code));
+                                                      pqrs::hid::country_code::value_t(country_code)};
 
   client->connected.connect([parameters] {
     set_flag(flag_connected, true);

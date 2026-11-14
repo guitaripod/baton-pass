@@ -16,6 +16,7 @@ pub struct Link {
     counter: Counter,
     hello_nonce: u64,
     last_hello: Option<Instant>,
+    next_peer: usize,
     pub peer: Option<SocketAddr>,
     pub token: Option<u64>,
     peer_counter: u64,
@@ -38,12 +39,17 @@ impl Link {
             counter: Counter::new(),
             hello_nonce: random_u64(),
             last_hello: None,
+            next_peer: 0,
             peer: None,
             token: None,
             peer_counter: 0,
             last_heard: Instant::now(),
             flags: 0,
         })
+    }
+
+    pub fn cipher(&self) -> Rc<Cipher> {
+        self.cipher.clone()
     }
 
     pub fn connected(&self) -> bool {
@@ -55,9 +61,12 @@ impl Link {
             tracing::warn!("lost the Mac: {reason}");
         }
         self.flags = 0;
+        self.next_peer = 0;
+        self.last_hello = None;
     }
 
-    /// Sends Hello to every configured peer until one answers; drops a silent session.
+    /// Greets one configured peer per interval, in order, so the wired address wins whenever it
+    /// answers and the tailnet name is only a fallback; drops a session that went silent.
     pub async fn maintain(&mut self) {
         if self.connected() && self.last_heard.elapsed() > IDLE_TIMEOUT {
             self.disconnect("no reply for 3 s");
@@ -67,18 +76,20 @@ impl Link {
         }
         self.last_hello = Some(Instant::now());
         self.hello_nonce = random_u64();
+        if self.peers.is_empty() {
+            return;
+        }
+        let peer = self.peers[self.next_peer % self.peers.len()].clone();
+        self.next_peer = (self.next_peer + 1) % self.peers.len();
         let packet = self.seal(0, Msg::Hello { nonce: self.hello_nonce });
-        for peer in &self.peers {
-            match tokio::net::lookup_host(peer).await {
-                Ok(addresses) => {
-                    for address in addresses.filter(SocketAddr::is_ipv4) {
-                        if let Err(error) = self.socket.send_to(&packet, address).await {
-                            tracing::debug!("hello to {address}: {error}");
-                        }
+        match tokio::net::lookup_host(&peer).await {
+            Ok(mut addresses) => {
+                if let Some(address) = addresses.find(SocketAddr::is_ipv4)
+                    && let Err(error) = self.socket.send_to(&packet, address).await {
+                        tracing::debug!("hello to {address}: {error}");
                     }
-                }
-                Err(error) => tracing::debug!("resolving {peer}: {error}"),
             }
+            Err(error) => tracing::debug!("resolving {peer}: {error}"),
         }
     }
 

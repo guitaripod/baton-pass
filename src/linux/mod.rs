@@ -4,6 +4,7 @@ pub mod install;
 mod keymap;
 mod link;
 mod portal;
+pub mod probe;
 mod slam;
 
 use crate::config::{Config, Side};
@@ -69,6 +70,8 @@ struct Daemon {
     reopen_at: Option<Instant>,
     last_heartbeat: Instant,
     portal_error: Option<String>,
+    opening: bool,
+    opened: mpsc::UnboundedSender<Result<(Portal, Ei, PortalSignals)>>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -85,6 +88,7 @@ pub async fn run(config: Config) -> Result<()> {
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     tokio::task::spawn_local(clipboard_worker(cipher.clone(), clip_rx));
     let link = Link::new(cipher, config.peer_addresses()).await?;
+    let (opened_tx, mut opened) = mpsc::unbounded_channel();
 
     let mut daemon = Daemon {
         config,
@@ -100,9 +104,12 @@ pub async fn run(config: Config) -> Result<()> {
         reopen_at: None,
         last_heartbeat: Instant::now(),
         portal_error: None,
+        opening: false,
+        opened: opened_tx,
     };
-    let (mut ei, signals) = daemon.open_portal().await;
-    let mut streams = Streams::from(signals);
+    let mut ei: Option<Ei> = None;
+    let mut streams = Streams::default();
+    daemon.start_opening();
 
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -157,12 +164,31 @@ pub async fn run(config: Config) -> Result<()> {
                     daemon.rearm_at = Some(Instant::now() + REARM_DELAY);
                 }
             }
+            result = opened.recv() => {
+                daemon.opening = false;
+                match result {
+                    Some(Ok((portal, opened_ei, signals))) => {
+                        daemon.portal = Some(portal);
+                        daemon.portal_error = None;
+                        daemon.rearm_at = Some(Instant::now());
+                        ei = Some(opened_ei);
+                        streams = Streams::from(Some(signals));
+                        tracing::info!("input capture session ready");
+                    }
+                    Some(Err(error)) => {
+                        tracing::error!("input capture unavailable: {error:#}");
+                        if !was_declined(&error) {
+                            daemon.reopen_at = Some(Instant::now() + RETRY_DELAY * 6);
+                        }
+                        daemon.portal_error = Some(format!("{error:#}"));
+                    }
+                    None => {}
+                }
+            }
             request = requests.recv() => match request {
                 Some(Request::Toggle(position)) => {
                     if daemon.portal.is_none() {
-                        let (opened, signals) = daemon.open_portal().await;
-                        ei = opened;
-                        streams = Streams::from(signals);
+                        daemon.start_opening();
                     }
                     daemon.on_toggle(position).await;
                 }
@@ -174,12 +200,7 @@ pub async fn run(config: Config) -> Result<()> {
             _ = ticker.tick() => {
                 if daemon.reopen_at.is_some_and(|at| Instant::now() >= at) {
                     daemon.reopen_at = None;
-                    let (opened, signals) = daemon.open_portal().await;
-                    ei = opened;
-                    streams = Streams::from(signals);
-                    if daemon.portal.is_none() {
-                        daemon.reopen_at = Some(Instant::now() + RETRY_DELAY * 6);
-                    }
+                    daemon.start_opening();
                 }
                 daemon.tick().await;
             }
@@ -228,20 +249,17 @@ impl From<Option<PortalSignals>> for Streams {
 }
 
 impl Daemon {
-    async fn open_portal(&mut self) -> (Option<Ei>, Option<PortalSignals>) {
-        match Portal::open(install::APP_ID).await {
-            Ok((portal, ei, signals)) => {
-                self.portal = Some(portal);
-                self.portal_error = None;
-                self.rearm_at = Some(Instant::now());
-                (Some(ei), Some(signals))
-            }
-            Err(error) => {
-                tracing::error!("input capture unavailable: {error:#}");
-                self.portal_error = Some(format!("{error:#}"));
-                (None, None)
-            }
+    /// Asks the portal for a capture session in the background: the first time, KDE shows a
+    /// permission dialog, and the daemon must keep answering status calls while it waits.
+    fn start_opening(&mut self) {
+        if self.opening || self.portal.is_some() {
+            return;
         }
+        self.opening = true;
+        let opened = self.opened.clone();
+        tokio::task::spawn_local(async move {
+            let _ = opened.send(Portal::open(install::APP_ID).await);
+        });
     }
 
     async fn drop_portal(&mut self) {
@@ -547,6 +565,7 @@ impl Daemon {
                 self.hotkey.qt_name()
             ),
             (None, Some(_)) => "capture: not armed".into(),
+            (None, None) if self.opening => "capture: waiting for the input capture permission dialog".into(),
             (None, None) => "capture: no portal session".into(),
         });
         if let Some(error) = &self.portal_error {
@@ -564,6 +583,16 @@ impl Daemon {
             portal.close().await;
         }
     }
+}
+
+/// True when the user pressed Deny in KDE's input capture dialog, which must not be re-asked unprompted.
+fn was_declined(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ashpd::Error>(),
+            Some(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled))
+        )
+    })
 }
 
 /// Converts Wayland wheel motion into HID wheel units: positive vertical means away from the

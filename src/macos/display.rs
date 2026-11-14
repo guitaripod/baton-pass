@@ -53,12 +53,9 @@ impl Rect {
 unsafe extern "C" {
     fn CGEventCreate(source: *const c_void) -> *mut c_void;
     fn CGEventGetLocation(event: *mut c_void) -> Point;
-    fn CGWarpMouseCursorPosition(point: Point) -> i32;
-    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
     fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> Rect;
     fn CGDisplayIsBuiltin(display: u32) -> i32;
-    fn CGDisplayIsAsleep(display: u32) -> i32;
     fn CGDisplayMirrorsDisplay(display: u32) -> u32;
 }
 
@@ -79,21 +76,15 @@ pub fn cursor() -> Option<Point> {
     }
 }
 
-/// Moves the cursor without the quarter-second input freeze macOS normally applies after a warp.
-pub fn warp(point: Point) {
-    unsafe {
-        CGWarpMouseCursorPosition(point);
-        CGAssociateMouseAndMouseCursorPosition(1);
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Display {
     pub bounds: Rect,
     pub builtin: bool,
 }
 
-/// Every awake, non-mirroring display, in global points with the origin at the main display's top left.
+/// Every non-mirroring display, in global points with the origin at the main display's top left.
+/// Sleep state is not consulted: outside the GUI session macOS reports every display as asleep,
+/// and the first injected movement wakes a sleeping one anyway.
 pub fn online() -> Vec<Display> {
     let mut ids = [0u32; 32];
     let mut count = 0u32;
@@ -102,7 +93,7 @@ pub fn online() -> Vec<Display> {
     }
     ids[..count as usize]
         .iter()
-        .filter(|id| unsafe { CGDisplayIsAsleep(**id) == 0 && CGDisplayMirrorsDisplay(**id) == 0 })
+        .filter(|id| unsafe { CGDisplayMirrorsDisplay(**id) == 0 })
         .map(|id| Display {
             bounds: unsafe { CGDisplayBounds(*id) },
             builtin: unsafe { CGDisplayIsBuiltin(*id) != 0 },

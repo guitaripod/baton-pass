@@ -1,4 +1,5 @@
 mod display;
+mod linear;
 pub mod pasteboard;
 mod vhid;
 
@@ -23,6 +24,14 @@ const DISPLAY_REFRESH: Duration = Duration::from_secs(1);
 const EXIT_RESEND: Duration = Duration::from_millis(30);
 const PUSH_MEMORY: Duration = Duration::from_millis(60);
 const CALIBRATION_COUNTS: i8 = 60;
+const PARKING_LIMIT: Duration = Duration::from_millis(500);
+
+/// Counts posted since `start` was read, for re-measuring the count-to-point ratio during use.
+struct Window {
+    start: Point,
+    opened: Instant,
+    posted: (f64, f64),
+}
 
 /// Session state that both the datagram loop and the clipboard connections check.
 struct Gate {
@@ -52,6 +61,9 @@ struct Receiver {
     pushed: Option<(f32, f32, Instant)>,
     points_per_count: Option<f64>,
     last_calibration: Option<Instant>,
+    pointer_was_ready: bool,
+    window: Option<Window>,
+    parking: Option<(Point, Instant)>,
     displays: Vec<Rect>,
     displays_at: Option<Instant>,
 }
@@ -87,6 +99,9 @@ pub async fn run(config: Config) -> Result<()> {
         pushed: None,
         points_per_count: None,
         last_calibration: None,
+        pointer_was_ready: false,
+        window: None,
+        parking: None,
         displays: Vec::new(),
         displays_at: None,
     };
@@ -95,8 +110,10 @@ pub async fn run(config: Config) -> Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut buffer = vec![0u8; 2048];
     tracing::info!("ferry {} listening on {}", env!("CARGO_PKG_VERSION"), config.listen);
+    let mut next_tick = tokio::time::Instant::now();
     loop {
-        let poll = if receiver.entered { POLL_ENTERED } else { POLL_IDLE };
+        let poll = receiver.poll_interval();
+        next_tick = next_tick.min(tokio::time::Instant::now() + poll);
         tokio::select! {
             received = receiver.socket.recv_from(&mut buffer) => match received {
                 Ok((length, from)) => receiver.on_datagram(&buffer[..length], from).await,
@@ -111,7 +128,10 @@ pub async fn run(config: Config) -> Result<()> {
                 }
                 Err(error) => tracing::debug!("tcp accept: {error}"),
             },
-            _ = tokio::time::sleep(poll) => receiver.tick().await,
+            _ = tokio::time::sleep_until(next_tick) => {
+                receiver.tick().await;
+                next_tick = tokio::time::Instant::now() + receiver.poll_interval();
+            }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
         }
@@ -193,11 +213,10 @@ impl Receiver {
             Msg::Pointer { dx, dy, wheel_v, wheel_h, buttons } => {
                 self.pointer(dx, dy, wheel_v, wheel_h, buttons).await;
             }
-            Msg::Keys(keys) => {
-                if self.entered {
+            Msg::Keys(keys)
+                if self.entered => {
                     self.apply_keys(keys);
                 }
-            }
             _ => {}
         }
     }
@@ -215,17 +234,16 @@ impl Receiver {
         if self.points_per_count.is_none() {
             self.calibrate().await;
         }
+        self.window = None;
         if frac.is_finite() {
             if let Some(point) = self.entry_point(frac) {
-                display::warp(point);
+                self.move_to(point).await;
             }
-        } else if let Some(cursor) = display::cursor() {
-            if !self.displays.iter().any(|rect| rect.contains(cursor)) {
-                if let Some(first) = self.displays.first() {
-                    display::warp(first.center());
+        } else if let Some(cursor) = display::cursor()
+            && !self.displays.iter().any(|rect| rect.contains(cursor))
+                && let Some(first) = self.displays.first().copied() {
+                    self.move_to(first.center()).await;
                 }
-            }
-        }
         tracing::info!("in control (entered at {})", if frac.is_finite() { format!("{frac:.2}") } else { "hotkey".into() });
     }
 
@@ -287,17 +305,67 @@ impl Receiver {
         if x == 0 && y == 0 && vertical == 0 && horizontal == 0 && !buttons_changed {
             return;
         }
-        loop {
-            let step = |value: &mut i32| -> i8 {
-                let part = (*value).clamp(-127, 127);
-                *value -= part;
-                part as i8
-            };
-            let (sx, sy, sv, sh) = (step(&mut x), step(&mut y), step(&mut vertical), step(&mut horizontal));
-            vhid::pointing(buttons, sx, sy, sv, sh);
-            if x == 0 && y == 0 && vertical == 0 && horizontal == 0 {
-                break;
+        if let Some(window) = self.window.as_mut() {
+            window.posted.0 += x as f64;
+            window.posted.1 += y as f64;
+        }
+        post_motion(buttons, &mut x, &mut y, &mut vertical, &mut horizontal);
+    }
+
+    /// Refines the count-to-point ratio from real use: over each tenth of a second, compares
+    /// how far the cursor actually went with how many counts were posted. This tracks changes
+    /// to the Mac's tracking speed, and LinearMouse settling, without moving the cursor itself.
+    fn learn_ratio(&mut self, cursor: Point) {
+        const MARGIN: f64 = 24.0;
+        let inside = |point: Point| {
+            self.displays.iter().any(|rect| {
+                point.x >= rect.min_x() + MARGIN
+                    && point.x < rect.max_x() - MARGIN
+                    && point.y >= rect.min_y() + MARGIN
+                    && point.y < rect.max_y() - MARGIN
+            })
+        };
+        let Some(window) = &self.window else {
+            self.window = Some(Window { start: cursor, opened: Instant::now(), posted: (0.0, 0.0) });
+            return;
+        };
+        if window.opened.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        let posted = window.posted.0.hypot(window.posted.1);
+        let moved = (cursor.x - window.start.x).hypot(cursor.y - window.start.y);
+        if posted >= 40.0 && inside(window.start) && inside(cursor) {
+            let sample = moved / posted;
+            if (0.05..=10.0).contains(&sample) {
+                let ratio = self.points_per_count.map_or(sample, |ratio| ratio * 0.7 + sample * 0.3);
+                if self.points_per_count.is_some_and(|old| (old - ratio).abs() / old > 0.05) {
+                    tracing::info!("virtual mouse now moves {ratio:.3} points per count");
+                }
+                self.points_per_count = Some(ratio);
             }
+        }
+        self.window = Some(Window { start: cursor, opened: Instant::now(), posted: (0.0, 0.0) });
+    }
+
+    /// Posts one relative move toward `target`, sized with the calibrated count-to-point ratio.
+    /// Warping is avoided on purpose: macOS drops hardware mouse input for a quarter second after one.
+    fn nudge_to(&self, target: Point) -> bool {
+        let (Some(ratio), Some(now)) = (self.points_per_count, display::cursor()) else { return true };
+        let (dx, dy) = (target.x - now.x, target.y - now.y);
+        if dx.abs() < 1.0 && dy.abs() < 1.0 {
+            return true;
+        }
+        let (mut x, mut y) = ((dx / ratio).round() as i32, (dy / ratio).round() as i32);
+        post_motion(self.buttons, &mut x, &mut y, &mut 0, &mut 0);
+        false
+    }
+
+    async fn move_to(&self, target: Point) {
+        for _ in 0..4 {
+            if self.nudge_to(target) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(6)).await;
         }
     }
 
@@ -312,13 +380,36 @@ impl Receiver {
         }
     }
 
+    fn poll_interval(&self) -> Duration {
+        if self.entered || self.parking.is_some() { POLL_ENTERED } else { POLL_IDLE }
+    }
+
+    /// Keeps pulling the cursor back to where it left until it sits on an allowed display, since
+    /// motion posted just before the crossing can still land after the first correction.
+    fn settle_parking(&mut self) {
+        let Some((park, since)) = self.parking else { return };
+        let settled = display::cursor().is_some_and(|cursor| self.displays.iter().any(|rect| rect.contains(cursor)));
+        if settled || since.elapsed() > PARKING_LIMIT {
+            self.parking = None;
+        } else {
+            self.nudge_to(park);
+        }
+    }
+
     async fn tick(&mut self) {
+        self.settle_parking();
         if self.entered && self.last_heard.elapsed() > SILENCE_LIMIT {
             self.leave("the desktop went quiet");
         }
+        let ready = vhid::pointing_ready();
+        if ready != self.pointer_was_ready {
+            self.pointer_was_ready = ready;
+            self.points_per_count = None;
+            self.last_calibration = None;
+        }
         if !self.entered {
             let due = self.last_calibration.is_none_or(|at| at.elapsed() > Duration::from_secs(30));
-            if self.points_per_count.is_none() && due && vhid::pointing_ready() {
+            if self.points_per_count.is_none() && due && ready {
                 self.calibrate().await;
             }
             return;
@@ -328,17 +419,21 @@ impl Receiver {
         }
         self.refresh_displays(false);
         let Some(cursor) = display::cursor() else { return };
+        self.learn_ratio(cursor);
         let pushing = self.pushed.filter(|(_, _, at)| at.elapsed() < PUSH_MEMORY).map(|(dx, dy, _)| (dx, dy));
         match edge_decision(&self.displays, self.exit_side, cursor, pushing) {
             EdgeDecision::Stay => {}
             EdgeDecision::Exit { frac, park } => {
                 vhid::pointing(0, 0, 0, 0, 0);
                 self.buttons = 0;
-                display::warp(park);
+                self.nudge_to(park);
+                self.parking = Some((park, Instant::now()));
                 tracing::info!("cursor crossed the {:?} edge", self.exit_side);
                 self.send_exit(frac).await;
             }
-            EdgeDecision::Clamp(point) => display::warp(point),
+            EdgeDecision::Clamp(point) => {
+                self.nudge_to(point);
+            }
         }
     }
 
@@ -366,21 +461,29 @@ impl Receiver {
         })
     }
 
-    /// Measures how many points the cursor travels per virtual-mouse count, then puts it back.
+    /// Measures how many points the cursor travels per virtual-mouse count with a short
+    /// out-and-back move toward the middle of its display.
     async fn calibrate(&mut self) {
         self.last_calibration = Some(Instant::now());
         if !vhid::pointing_ready() {
             return;
         }
+        linear::ensure_linear_pointer().await;
         self.refresh_displays(true);
-        let (Some(original), Some(area)) = (display::cursor(), self.displays.first().copied()) else { return };
-        let start = area.center();
-        display::warp(start);
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        vhid::pointing(0, CALIBRATION_COUNTS, 0, 0, 0);
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let moved = display::cursor().map(|now| now.x - start.x);
-        display::warp(original);
+        let Some(start) = display::cursor() else { return };
+        let Some(area) = self
+            .displays
+            .iter()
+            .min_by(|a, b| a.distance(start).total_cmp(&b.distance(start)))
+            .copied()
+        else {
+            return;
+        };
+        let direction: i8 = if start.x < area.center().x { 1 } else { -1 };
+        vhid::pointing(0, direction * CALIBRATION_COUNTS, 0, 0, 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let moved = display::cursor().map(|now| (now.x - start.x) * direction as f64);
+        vhid::pointing(0, -direction * CALIBRATION_COUNTS, 0, 0, 0);
         match moved {
             Some(moved) if moved > 1.0 => {
                 let ratio = moved / CALIBRATION_COUNTS as f64;
@@ -388,6 +491,22 @@ impl Receiver {
                 self.points_per_count = Some(ratio);
             }
             other => tracing::warn!("calibration saw no movement ({other:?}); retrying later"),
+        }
+    }
+}
+
+/// Posts a relative pointer move, split into reports that fit the virtual mouse's 8-bit fields.
+fn post_motion(buttons: u32, x: &mut i32, y: &mut i32, vertical: &mut i32, horizontal: &mut i32) {
+    let step = |value: &mut i32| -> i8 {
+        let part = (*value).clamp(-127, 127);
+        *value -= part;
+        part as i8
+    };
+    loop {
+        let (sx, sy, sv, sh) = (step(x), step(y), step(vertical), step(horizontal));
+        vhid::pointing(buttons, sx, sy, sv, sh);
+        if *x == 0 && *y == 0 && *vertical == 0 && *horizontal == 0 {
+            break;
         }
     }
 }

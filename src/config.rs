@@ -14,6 +14,7 @@ pub enum Side {
 }
 
 impl Side {
+    #[cfg(target_os = "linux")]
     pub fn to_wire(self) -> u8 {
         match self {
             Side::Left => 0,
@@ -46,6 +47,7 @@ impl Side {
 }
 
 /// Appends the default port unless the peer already names one; bare IPv6 addresses get brackets.
+#[cfg(target_os = "linux")]
 fn with_default_port(peer: &str) -> String {
     let colons = peer.matches(':').count();
     if peer.starts_with('[') {
@@ -133,6 +135,7 @@ impl Config {
         Ok(config)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn peer_addresses(&self) -> Vec<String> {
         self.peers.iter().map(|peer| with_default_port(peer)).collect()
     }
