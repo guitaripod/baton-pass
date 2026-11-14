@@ -1,5 +1,10 @@
 use crate::clip::Clip;
 pub const MAX_KEYS: usize = 32;
+
+/// IPTOS_LOWDELAY. On Linux it gives the socket interactive priority, which the default fq
+/// queueing discipline serves first: without it, a saturating upload (a torrent client) fills
+/// the NIC queue and the kernel silently drops our datagrams.
+pub const LOW_DELAY: u32 = 0x10;
 pub const MAX_CLIPBOARD: usize = 32 * 1024 * 1024;
 
 pub const FLAG_KEYBOARD_READY: u8 = 2;

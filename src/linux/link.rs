@@ -34,6 +34,7 @@ pub struct Link {
     last_send_warning: Option<Instant>,
     roam_allowed: bool,
     last_roam: Option<Instant>,
+    sent_since_reply: u32,
     pub flags: u8,
 }
 
@@ -45,6 +46,9 @@ pub enum Incoming {
 impl Link {
     pub async fn new(cipher: Rc<Cipher>, peers: Vec<String>) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        if let Err(error) = socket.set_tos_v4(crate::proto::LOW_DELAY) {
+            tracing::warn!("marking packets low-delay: {error}");
+        }
         Ok(Self {
             socket,
             cipher,
@@ -64,6 +68,7 @@ impl Link {
             last_send_warning: None,
             roam_allowed: false,
             last_roam: None,
+            sent_since_reply: 0,
             flags: 0,
         })
     }
@@ -102,6 +107,7 @@ impl Link {
     fn heard(&mut self) {
         self.last_heard = Instant::now();
         self.silence.heard();
+        self.sent_since_reply = 0;
     }
 
     /// Lets the link move to the first configured peer while nothing is captured: a new
@@ -117,7 +123,8 @@ impl Link {
     /// answers and the tailnet name is only a fallback; drops a session that went silent.
     pub async fn maintain(&mut self) {
         if self.connected() && self.quiet() > IDLE_TIMEOUT {
-            self.disconnect("no reply for 3 s");
+            let reason = format!("no reply for 3 s ({} packets sent since the last one)", self.sent_since_reply);
+            self.disconnect(&reason);
         }
         if self.connected() {
             self.roam().await;
@@ -197,6 +204,7 @@ impl Link {
 
     pub async fn send(&mut self, msg: Msg) {
         let (Some(token), Some(peer)) = (self.token, self.peer) else { return };
+        self.sent_since_reply += 1;
         let packet = self.seal(token, msg);
         if let Err(error) = self.socket.send_to(&packet, peer).await
             && self.last_send_warning.is_none_or(|at| at.elapsed() > SEND_WARNING_INTERVAL)

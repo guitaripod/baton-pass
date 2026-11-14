@@ -68,6 +68,7 @@ struct Receiver {
     confine: Confine,
     silence: Silence,
     quiet_released: bool,
+    last_packet: Option<Instant>,
     watcher: display::Watcher,
     entered: bool,
     exiting: Option<(f32, Instant)>,
@@ -97,6 +98,9 @@ pub async fn run(config: Config) -> Result<()> {
     let cipher = Rc::new(Cipher::load(&Config::key_path())?);
     vhid::start();
     let socket = Rc::new(UdpSocket::bind(&config.listen).await.with_context(|| format!("binding {}", config.listen))?);
+    if let Err(error) = socket.set_tos_v4(crate::proto::LOW_DELAY) {
+        tracing::warn!("marking packets low-delay: {error}");
+    }
     let listener = TcpListener::bind(&config.listen).await?;
     let gate = Rc::new(RefCell::new(Gate {
         doorman: Doorman::new(),
@@ -112,6 +116,7 @@ pub async fn run(config: Config) -> Result<()> {
         confine: config.confine,
         silence: Silence::default(),
         quiet_released: false,
+        last_packet: None,
         watcher: display::Watcher::start(DISPLAY_REFRESH),
         entered: false,
         exiting: None,
@@ -204,9 +209,10 @@ impl Receiver {
             }
             Admission::Joined { to, welcome } => {
                 self.gate.borrow_mut().tcp_counter = 0;
+                let previous = self.last_packet.map(|at| format!(" (the last session's last packet came {} ms ago)", at.elapsed().as_millis()));
                 self.heard();
                 self.leave("new session");
-                tracing::info!("session with {to}");
+                tracing::info!("session with {to}{}", previous.unwrap_or_default());
                 self.reply(to, 0, welcome).await;
                 return;
             }
@@ -456,6 +462,7 @@ impl Receiver {
     fn heard(&mut self) {
         self.silence.heard();
         self.quiet_released = false;
+        self.last_packet = Some(Instant::now());
     }
 
     /// Counts the time since the last tick toward the desktop's silence, but only as much as a
