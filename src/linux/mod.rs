@@ -39,6 +39,9 @@ const REOPEN_DELAY: Duration = Duration::from_secs(2);
 const SLAM_RETRY: Duration = Duration::from_millis(250);
 const RETURN_INSET: f64 = 48.0;
 const BOUNCE_GUARD: Duration = Duration::from_millis(400);
+const STRAY_PERSIST: Duration = Duration::from_millis(250);
+const STRAY_GAP: Duration = Duration::from_millis(150);
+const STRAY_ESCALATE: Duration = Duration::from_secs(4);
 
 struct Capture {
     activation_id: Option<u32>,
@@ -88,6 +91,7 @@ struct Daemon {
     session_lost: Option<String>,
     last_release: Option<Instant>,
     last_stray_release: Option<Instant>,
+    stray: Option<(Instant, Instant)>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -125,6 +129,7 @@ pub async fn run(config: Config) -> Result<()> {
         session_lost: None,
         last_release: None,
         last_stray_release: None,
+        stray: None,
     };
     let mut ei: Option<Ei> = None;
     let mut streams = Streams::default();
@@ -162,11 +167,11 @@ pub async fn run(config: Config) -> Result<()> {
             },
             disabled = next_signal(&mut streams.disabled) => match disabled {
                 Some(_) => {
-                    daemon.end_capture("capture disabled").await;
-                    if let Some(portal) = daemon.portal.as_mut() {
-                        portal.armed = false;
+                    if !daemon.portal.as_mut().is_some_and(|portal| portal.own_disable()) {
+                        tracing::info!("the compositor disabled input capture");
+                        daemon.end_capture("capture disabled").await;
+                        daemon.rearm_at = Some(Instant::now() + REARM_DELAY);
                     }
-                    daemon.rearm_at = Some(Instant::now() + REARM_DELAY);
                 }
                 None => daemon.session_lost = Some("portal signals stopped".into()),
             },
@@ -307,6 +312,7 @@ impl Daemon {
     }
 
     async fn on_activated(&mut self, activated: Activated) {
+        self.stray = None;
         if self.capture.is_some() {
             return;
         }
@@ -365,7 +371,7 @@ impl Daemon {
         let natural = self.config.natural_scroll;
         let Some(capture) = self.capture.as_mut() else {
             if is_input(&event) {
-                self.release_stray_capture().await;
+                self.on_stray_input().await;
             }
             return;
         };
@@ -417,20 +423,37 @@ impl Daemon {
         }
     }
 
-    /// Input arriving with no capture of ours means the compositor still holds one (a lost
-    /// Release or a restart mid-capture), which leaves the desktop cursor hidden and dead.
-    /// Disabling the session makes the compositor hand input back.
+    /// Input arriving with no capture of ours means the compositor holds one that ferry is not
+    /// tracking, which leaves the desktop cursor hidden and dead. A short burst is normal: the
+    /// first events of a new capture can beat its Activated signal, and the last of an ended
+    /// one can trail its release. Only input that keeps coming for `STRAY_PERSIST` is acted on.
+    async fn on_stray_input(&mut self) {
+        let now = Instant::now();
+        let first = match self.stray {
+            Some((first, last)) if now - last < STRAY_GAP => first,
+            _ => now,
+        };
+        self.stray = Some((first, now));
+        if now - first >= STRAY_PERSIST {
+            self.stray = None;
+            self.release_stray_capture().await;
+        }
+    }
+
+    /// Removes the barrier, which makes the compositor end the capture and show the cursor. If
+    /// input still keeps arriving after that, the session itself is closed and reopened.
     async fn release_stray_capture(&mut self) {
-        if self.last_stray_release.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        let now = Instant::now();
+        let previous = self.last_stray_release.replace(now);
+        if previous.is_some_and(|at| now - at < STRAY_ESCALATE) {
+            self.session_lost = Some("the compositor kept capturing after the barrier was removed".into());
             return;
         }
-        self.last_stray_release = Some(Instant::now());
         tracing::warn!("input arrived without a capture; handing it back to the desktop");
         if let Some(portal) = self.portal.as_mut() {
-            portal.armed = true;
-            portal.disarm().await;
+            portal.force_disarm().await;
         }
-        self.rearm_at = Some(Instant::now() + REARM_DELAY);
+        self.rearm_at = Some(now + REARM_DELAY);
     }
 
     async fn flush_pointer(&mut self) {
@@ -507,11 +530,8 @@ impl Daemon {
             control::notify(&self.bus, "The Mac is not reachable", "ferry keeps looking for it").await;
             return;
         }
-        let armed = self.portal.as_ref().is_some_and(|portal| portal.armed);
-        if !armed {
-            self.arm().await;
-        }
-        let Some(portal) = self.portal.as_ref().filter(|portal| portal.armed) else {
+        self.arm().await;
+        let Some(portal) = self.portal.as_ref().filter(|portal| portal.armed()) else {
             control::notify(&self.bus, "Input capture is not ready", self.portal_error.as_deref().unwrap_or("")).await;
             return;
         };
@@ -543,7 +563,6 @@ impl Daemon {
     async fn arm(&mut self) {
         let side = self.config.side;
         let Some(portal) = self.portal.as_mut() else { return };
-        portal.disarm().await;
         match portal.arm(side).await {
             Ok(()) => self.portal_error = None,
             Err(error) => {
@@ -580,7 +599,7 @@ impl Daemon {
 
         if !connected
             && let Some(portal) = self.portal.as_mut()
-            && portal.armed
+            && portal.armed()
         {
             portal.disarm().await;
             self.rearm_at = Some(Instant::now());
@@ -592,7 +611,7 @@ impl Daemon {
         let needed = self.config.edge || self.capture.is_some() || self.pending_toggle.is_some();
         if !needed
             && let Some(portal) = self.portal.as_mut()
-            && portal.armed
+            && portal.armed()
         {
             portal.disarm().await;
         }
@@ -649,7 +668,7 @@ impl Daemon {
                 if capture.via_hotkey { " (hotkey)" } else { "" }
             ),
             (None, Some(_)) if !self.config.edge => format!("capture: hotkey only ({}), edge off", self.hotkey.qt_name()),
-            (None, Some(portal)) if portal.armed => format!(
+            (None, Some(portal)) if portal.armed() => format!(
                 "capture: armed on the {:?} edge ({} barrier(s)), hotkey {}",
                 self.config.side,
                 portal.edges().len(),

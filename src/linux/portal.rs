@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ashpd::desktop::input_capture::{
     Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSession2Options,
     CreateSessionOptions, Deactivated, Disabled, InputCapture, Region, ReleaseOptions,
-    StartOptions, ZonesChanged,
+    SetPointerBarriersResponse, StartOptions, ZonesChanged,
 };
 use ashpd::desktop::{PersistMode, Session};
 use futures_util::Stream;
@@ -13,8 +13,12 @@ use reis::tokio::EiConvertEventStream;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 pub type Signals<T> = Pin<Box<dyn Stream<Item = T>>>;
+
+/// How long the Disabled signal echoing one of ferry's own barrier changes may take to arrive.
+const DISABLE_ECHO: Duration = Duration::from_secs(2);
 
 pub struct PortalSignals {
     pub activated: Signals<Activated>,
@@ -55,7 +59,8 @@ pub struct Portal {
     capture: &'static InputCapture,
     session: Session<InputCapture>,
     edges: Vec<Edge>,
-    pub armed: bool,
+    enabled: bool,
+    expected_disables: Vec<Instant>,
 }
 
 impl Portal {
@@ -113,7 +118,8 @@ impl Portal {
             .handshake_tokio("ferry", ei::handshake::ContextType::Receiver)
             .await
             .map_err(|error| anyhow!("ei handshake: {error:?}"))?;
-        Ok((Self { capture, session, edges: Vec::new(), armed: false }, Ei { context, events }, signals))
+        let portal = Self { capture, session, edges: Vec::new(), enabled: false, expected_disables: Vec::new() };
+        Ok((portal, Ei { context, events }, signals))
     }
 
     /// Places barriers on the outer `side` of the desktop and enables capture.
@@ -125,11 +131,7 @@ impl Portal {
         }
         let barriers: Vec<Barrier> =
             edges.iter().map(|edge| Barrier::new(edge.id, barrier_line(edge.region, side))).collect();
-        let response = self
-            .capture
-            .set_pointer_barriers(&self.session, &barriers, zones.zone_set(), Default::default())
-            .await?
-            .response()?;
+        let response = self.set_barriers(&barriers, zones.zone_set()).await?;
         let failed = response.failed_barriers();
         let edges: Vec<Edge> = edges.into_iter().filter(|edge| !failed.contains(&edge.id)).collect();
         if edges.is_empty() {
@@ -142,17 +144,72 @@ impl Portal {
             edges.iter().map(|edge| edge.region).collect::<Vec<_>>()
         );
         self.edges = edges;
-        self.armed = true;
+        self.enabled = true;
         Ok(())
     }
 
+    pub fn armed(&self) -> bool {
+        self.enabled
+    }
+
+    /// Removes the barrier, ending any capture it started. The portal's Disable cannot do this:
+    /// xdg-desktop-portal-kde (6.8.2 and its master branch) forwards Disable to KWin as an
+    /// enable, so the barrier stays and a capture stays active. Changing the barriers is what
+    /// really disables a session there, and it is just as valid on other portals.
     pub async fn disarm(&mut self) {
-        if self.armed {
-            if let Err(error) = self.capture.disable(&self.session, Default::default()).await {
-                tracing::warn!("disabling capture: {error}");
-            }
-            self.armed = false;
+        if self.enabled {
+            self.clear_barriers().await;
         }
+    }
+
+    /// Disarms even when ferry believes the session is already disabled, for when the
+    /// compositor keeps delivering input that ferry never asked for.
+    pub async fn force_disarm(&mut self) {
+        self.enabled = true;
+        self.clear_barriers().await;
+        self.enabled = false;
+    }
+
+    async fn clear_barriers(&mut self) {
+        let result = async {
+            let zones = self.capture.zones(&self.session, Default::default()).await?.response()?;
+            self.set_barriers(&[], zones.zone_set()).await
+        }
+        .await;
+        match result {
+            Ok(_) => self.edges.clear(),
+            Err(error) => tracing::warn!("removing the barrier: {error:#}"),
+        }
+    }
+
+    /// Replaces the barriers. An enabled session is disabled first, which the compositor
+    /// announces with a Disabled signal of its own; that echo is remembered so it is not taken
+    /// for the compositor (or its Meta+Shift+Esc) turning capture off.
+    async fn set_barriers(&mut self, barriers: &[Barrier], zone_set: u32) -> Result<SetPointerBarriersResponse> {
+        let response = self
+            .capture
+            .set_pointer_barriers(&self.session, barriers, zone_set, Default::default())
+            .await?
+            .response()?;
+        if self.enabled {
+            self.enabled = false;
+            self.expected_disables.push(Instant::now() + DISABLE_ECHO);
+        }
+        Ok(response)
+    }
+
+    /// Sorts a Disabled signal: true when it echoes ferry's own barrier change, false when the
+    /// compositor disabled capture by itself (the session is then marked disabled).
+    pub fn own_disable(&mut self) -> bool {
+        let now = Instant::now();
+        self.expected_disables.retain(|deadline| *deadline > now);
+        if self.expected_disables.is_empty() {
+            self.enabled = false;
+            self.edges.clear();
+            return false;
+        }
+        self.expected_disables.remove(0);
+        true
     }
 
     pub async fn release(&self, activation_id: Option<u32>, position: (f64, f64)) -> Result<()> {
