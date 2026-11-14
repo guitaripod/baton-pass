@@ -25,6 +25,11 @@ impl Cipher {
         Ok(Self(XChaCha20Poly1305::new(key.as_slice().into())))
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn from_key(key: [u8; 32]) -> Self {
+        Self(XChaCha20Poly1305::new(&key.into()))
+    }
+
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce).expect("system randomness");

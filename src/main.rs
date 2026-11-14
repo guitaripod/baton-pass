@@ -1,6 +1,7 @@
 mod config;
 mod crypto;
 mod proto;
+mod session;
 
 #[cfg(target_os = "linux")]
 mod linux;

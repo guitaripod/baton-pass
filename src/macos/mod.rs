@@ -4,7 +4,8 @@ pub mod pasteboard;
 mod vhid;
 
 use crate::config::{Confine, Config, Side};
-use crate::crypto::{Cipher, Counter, random_u64};
+use crate::crypto::{Cipher, Counter};
+use crate::session::{Admission, Doorman, Silence};
 use crate::proto::{Envelope, FLAG_ENTERED, KeyState, MAX_CLIPBOARD, Msg};
 use anyhow::{Context, Result, bail};
 use display::{Point, Rect};
@@ -33,7 +34,6 @@ const NUDGE_SETTLE: Duration = Duration::from_millis(20);
 const SLOW_HANDLER: Duration = Duration::from_millis(50);
 const LATE_TICK: Duration = Duration::from_millis(150);
 const PARKING_LIMIT: Duration = Duration::from_millis(500);
-const CHALLENGE_LIFETIME: Duration = Duration::from_secs(5);
 const EXIT_ARM_DISTANCE: f64 = 24.0;
 
 /// A calibration in progress. It advances one step per tick, so the receive loop keeps
@@ -55,8 +55,7 @@ struct Window {
 
 /// Session state that both the datagram loop and the clipboard connections check.
 struct Gate {
-    token: Option<u64>,
-    peer: Option<SocketAddr>,
+    doorman: Doorman,
     tcp_counter: u64,
     counter: Counter,
     clipboard_busy: bool,
@@ -67,13 +66,9 @@ struct Receiver {
     cipher: Rc<Cipher>,
     gate: Rc<RefCell<Gate>>,
     confine: Confine,
-    udp_counter: u64,
-    quiet: Duration,
+    silence: Silence,
     quiet_released: bool,
-    last_tick: Option<Instant>,
     watcher: display::Watcher,
-    last_reset: Instant,
-    challenge: Option<(u64, SocketAddr, Instant)>,
     entered: bool,
     exiting: Option<(f32, Instant)>,
     exit_side: Side,
@@ -104,8 +99,7 @@ pub async fn run(config: Config) -> Result<()> {
     let socket = Rc::new(UdpSocket::bind(&config.listen).await.with_context(|| format!("binding {}", config.listen))?);
     let listener = TcpListener::bind(&config.listen).await?;
     let gate = Rc::new(RefCell::new(Gate {
-        token: None,
-        peer: None,
+        doorman: Doorman::new(),
         tcp_counter: 0,
         counter: Counter::new(),
         clipboard_busy: false,
@@ -115,13 +109,9 @@ pub async fn run(config: Config) -> Result<()> {
         cipher: cipher.clone(),
         gate: gate.clone(),
         confine: config.confine,
-        udp_counter: 0,
-        quiet: Duration::ZERO,
+        silence: Silence::default(),
         quiet_released: false,
-        last_tick: None,
         watcher: display::Watcher::start(DISPLAY_REFRESH),
-        last_reset: Instant::now() - Duration::from_secs(1),
-        challenge: None,
         entered: false,
         exiting: None,
         exit_side: Side::Right,
@@ -166,7 +156,7 @@ pub async fn run(config: Config) -> Result<()> {
             accepted = listener.accept() => match accepted {
                 Ok((stream, from)) => {
                     let mut state = gate.borrow_mut();
-                    let allowed = state.peer.map(|peer| peer.ip()) == Some(from.ip()) && !state.clipboard_busy;
+                    let allowed = state.doorman.peer().map(|peer| peer.ip()) == Some(from.ip()) && !state.clipboard_busy;
                     if allowed {
                         state.clipboard_busy = true;
                         tokio::task::spawn_local(serve_clipboard(stream, cipher.clone(), gate.clone()));
@@ -205,55 +195,25 @@ impl Receiver {
         let Some(envelope) = self.cipher.open(packet).and_then(|plain| Envelope::decode(&plain)) else {
             return;
         };
-        match envelope.msg {
-            Msg::Hello { nonce } => {
-                let challenge = random_u64();
-                self.challenge = Some((challenge, from, Instant::now()));
-                self.reply(from, 0, Msg::Challenge { nonce, challenge }).await;
+        let admission = self.gate.borrow_mut().doorman.admit(envelope, from);
+        let (token, msg) = match admission {
+            Admission::Answer { to, msg } => {
+                self.reply(to, 0, msg).await;
                 return;
             }
-            Msg::Join { nonce, challenge } => {
-                let answered = self.challenge.is_some_and(|(issued, to, at)| {
-                    issued == challenge && to == from && at.elapsed() < CHALLENGE_LIFETIME
-                });
-                if !answered {
-                    return;
-                }
-                self.challenge = None;
-                let token = random_u64();
-                {
-                    let mut gate = self.gate.borrow_mut();
-                    gate.token = Some(token);
-                    gate.peer = Some(from);
-                    gate.tcp_counter = 0;
-                }
-                self.udp_counter = envelope.counter;
+            Admission::Joined { to, welcome } => {
+                self.gate.borrow_mut().tcp_counter = 0;
                 self.heard();
                 self.leave("new session");
-                tracing::info!("session with {from}");
-                self.reply(from, 0, Msg::Welcome { nonce, token }).await;
+                tracing::info!("session with {to}");
+                self.reply(to, 0, welcome).await;
                 return;
             }
-            _ => {}
-        }
-        let (token, peer) = {
-            let gate = self.gate.borrow();
-            (gate.token, gate.peer)
+            Admission::Accept { token, msg } => (token, msg),
+            Admission::Ignore => return,
         };
-        if Some(envelope.token) != token || Some(from) != peer {
-            if envelope.token != 0 && self.last_reset.elapsed() > Duration::from_millis(200) {
-                self.last_reset = Instant::now();
-                self.reply(from, 0, Msg::Reset { token: envelope.token, counter: envelope.counter }).await;
-            }
-            return;
-        }
-        if envelope.counter <= self.udp_counter {
-            return;
-        }
-        self.udp_counter = envelope.counter;
         self.heard();
-        let token = envelope.token;
-        match envelope.msg {
+        match msg {
             Msg::Heartbeat { entered, keys, buttons } => {
                 if entered && !self.entered {
                     self.entered = true;
@@ -460,7 +420,7 @@ impl Receiver {
         self.exiting = Some((frac, Instant::now()));
         let (token, peer) = {
             let gate = self.gate.borrow();
-            (gate.token, gate.peer)
+            (gate.doorman.token(), gate.doorman.peer())
         };
         if let (Some(token), Some(peer)) = (token, peer) {
             self.reply(peer, token, Msg::Exit { frac }).await;
@@ -493,33 +453,32 @@ impl Receiver {
     }
 
     fn heard(&mut self) {
-        self.quiet = Duration::ZERO;
+        self.silence.heard();
         self.quiet_released = false;
     }
 
     /// Counts the time since the last tick toward the desktop's silence, but only as much as a
     /// running loop would take: time this loop spent blocked is not the desktop's fault.
     fn note_tick(&mut self) {
-        let now = Instant::now();
         let bound = self.poll_interval() * 2;
-        let gap = self.last_tick.replace(now).map_or(Duration::ZERO, |at| now - at);
-        self.quiet += gap.min(bound);
+        self.silence.observe(Instant::now(), bound);
     }
 
     /// A short silence only lets go of held keys and buttons, so nothing repeats or drags on its
     /// own; control stays here and carries on with the next packet. Only a long silence, the
     /// desktop gone for good, gives control up.
     async fn check_silence(&mut self) {
-        if !self.entered || self.quiet <= SILENCE_LIMIT {
+        if !self.entered || self.silence.quiet() <= SILENCE_LIMIT {
             return;
         }
         self.drain().await;
-        if self.quiet > LEAVE_LIMIT {
+        let quiet = self.silence.quiet();
+        if quiet > LEAVE_LIMIT {
             self.leave("the desktop went quiet");
-        } else if self.quiet > SILENCE_LIMIT && !self.quiet_released {
+        } else if quiet > SILENCE_LIMIT && !self.quiet_released {
             self.quiet_released = true;
             self.release_all();
-            tracing::info!("desktop quiet for {} ms; keys released, still in control", self.quiet.as_millis());
+            tracing::info!("desktop quiet for {} ms; keys released, still in control", quiet.as_millis());
         }
     }
 
@@ -853,7 +812,7 @@ async fn serve_clipboard(mut stream: TcpStream, cipher: Rc<Cipher>, gate: Rc<Ref
         }
         {
             let mut gate = gate.borrow_mut();
-            if Some(envelope.token) != gate.token || envelope.counter <= gate.tcp_counter {
+            if Some(envelope.token) != gate.doorman.token() || envelope.counter <= gate.tcp_counter {
                 bail!("stale clipboard request");
             }
             gate.tcp_counter = envelope.counter;

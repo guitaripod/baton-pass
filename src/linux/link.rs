@@ -1,5 +1,6 @@
 use crate::crypto::{Cipher, Counter, random_u64};
 use crate::proto::{Envelope, Msg};
+use crate::session::Silence;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -27,7 +28,7 @@ pub struct Link {
     peer_counter: u64,
     session_floor: u64,
     pub last_heard: Instant,
-    quiet: Duration,
+    silence: Silence,
     resolved: Rc<RefCell<HashMap<String, SocketAddr>>>,
     last_send_warning: Option<Instant>,
     pub flags: u8,
@@ -55,7 +56,7 @@ impl Link {
             peer_counter: 0,
             session_floor: 0,
             last_heard: Instant::now(),
-            quiet: Duration::ZERO,
+            silence: Silence::default(),
             resolved: Rc::new(RefCell::new(HashMap::new())),
             last_send_warning: None,
             flags: 0,
@@ -81,29 +82,27 @@ impl Link {
         self.joining = None;
     }
 
-    /// Counts `running` (time this daemon's loop was actually running) toward the Mac's
-    /// silence. Time the loop spent blocked is left out, so a stall here is never blamed on the
-    /// Mac: the heartbeats it would have answered were never sent.
-    pub fn note_running(&mut self, running: Duration) {
-        if self.connected() {
-            self.quiet += running;
-        }
+    /// Counts the time since the previous call toward the Mac's silence, at most `bound`, and
+    /// returns the whole gap. Time this daemon's loop spent blocked is left out, so a stall here
+    /// is never blamed on the Mac: the heartbeats it would have answered were never sent.
+    pub fn observe(&mut self, now: Instant, bound: Duration) -> Duration {
+        self.silence.observe(now, bound)
     }
 
     /// How long the Mac has been silent while this loop was running to hear it.
     pub fn quiet(&self) -> Duration {
-        self.quiet
+        self.silence.quiet()
     }
 
     fn heard(&mut self) {
         self.last_heard = Instant::now();
-        self.quiet = Duration::ZERO;
+        self.silence.heard();
     }
 
     /// Greets one configured peer per interval, in order, so the wired address wins whenever it
     /// answers and the tailnet name is only a fallback; drops a session that went silent.
     pub async fn maintain(&mut self) {
-        if self.connected() && self.quiet > IDLE_TIMEOUT {
+        if self.connected() && self.quiet() > IDLE_TIMEOUT {
             self.disconnect("no reply for 3 s");
         }
         if self.connected() || self.last_hello.is_some_and(|sent| sent.elapsed() < HELLO_INTERVAL) {

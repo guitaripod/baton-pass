@@ -7,6 +7,8 @@ mod portal;
 pub mod probe;
 mod slam;
 mod tray;
+#[cfg(test)]
+mod harness;
 
 use crate::config::{Config, Side};
 use crate::crypto::{Cipher, Counter};
@@ -97,7 +99,6 @@ struct Daemon {
     last_release: Option<Instant>,
     last_stray_release: Option<Instant>,
     stray: Option<(Instant, Instant)>,
-    last_tick: Option<Instant>,
     tray: Option<tray::Tray>,
     rtt: Option<Duration>,
     hiccups: VecDeque<(Instant, String)>,
@@ -141,7 +142,6 @@ pub async fn run(config: Config) -> Result<()> {
         last_release: None,
         last_stray_release: None,
         stray: None,
-        last_tick: None,
         tray: None,
         rtt: None,
         hiccups: VecDeque::new(),
@@ -645,9 +645,7 @@ impl Daemon {
     /// take counts toward the Mac's silence; a longer gap means this loop was blocked, which is
     /// logged, and a heartbeat goes out at once so the Mac hears from this side again.
     async fn note_tick(&mut self) {
-        let now = Instant::now();
-        let gap = self.last_tick.replace(now).map_or(TICK, |at| now - at);
-        self.link.note_running(gap.min(TICK * 2));
+        let gap = self.link.observe(Instant::now(), TICK * 2);
         if gap > LATE_TICK {
             tracing::warn!("event loop stalled: {} ms between ticks", gap.as_millis());
             self.note_hiccup(format!("ferry stalled for {} ms", gap.as_millis()));
