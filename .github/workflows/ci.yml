@@ -30,10 +30,7 @@ jobs:
           filters: |
             mac:
               - 'src/macos/**'
-              - 'src/session.rs'
-              - 'src/clip.rs'
-              - 'src/proto.rs'
-              - 'src/crypto.rs'
+              - 'src/*.rs'
               - 'cpp/**'
               - 'build.rs'
               - 'Cargo.toml'

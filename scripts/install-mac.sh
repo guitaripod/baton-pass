@@ -9,13 +9,12 @@ if [ ! -d "$vhid_app" ]; then
     echo "Karabiner-DriverKit-VirtualHIDDevice is not installed (install Karabiner-Elements)" >&2
     exit 1
 fi
+git submodule update --init --depth 1
 installed=$(defaults read "$vhid_app/Contents/Info" CFBundleShortVersionString)
 pinned=$(git -C vendor/karabiner-vhid describe --tags 2>/dev/null || echo unknown)
 if [ "v$installed" != "$pinned" ]; then
-    echo "note: Karabiner virtual HID daemon is $installed, headers are $pinned; baton-pass status reports a protocol mismatch if they disagree" >&2
+    echo "note: Karabiner virtual HID daemon is $installed, headers are $pinned; the desktop's \`baton-pass status\` reports a protocol mismatch if they disagree" >&2
 fi
-
-git submodule update --init --depth 1
 cargo build --release
 
 # Signs with the Developer ID kept in its own keychain (unlocked with a password file, so this
