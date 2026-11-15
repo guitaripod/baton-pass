@@ -50,6 +50,15 @@ enum Command {
         #[arg(long = "peer")]
         peers: Vec<String>,
     },
+    /// Copy this binary to /usr/local/bin and run it as a LaunchDaemon (run with sudo)
+    #[cfg(target_os = "macos")]
+    Install,
+    /// Stop the daemon and remove what install put in place (sudo on the Mac)
+    Uninstall {
+        /// Also remove the config and the shared key
+        #[arg(long)]
+        purge: bool,
+    },
     /// Check the link and the Mac side without touching local input
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
@@ -97,6 +106,12 @@ fn main() -> Result<()> {
         Command::Status => local.block_on(&runtime, linux::control::status()),
         #[cfg(target_os = "linux")]
         Command::Install { peers } => local.block_on(&runtime, linux::install::install(peers)),
+        #[cfg(target_os = "linux")]
+        Command::Uninstall { purge } => local.block_on(&runtime, linux::install::uninstall(purge)),
+        #[cfg(target_os = "macos")]
+        Command::Install => macos::install::install(),
+        #[cfg(target_os = "macos")]
+        Command::Uninstall { purge } => macos::install::uninstall(purge),
         #[cfg(target_os = "linux")]
         Command::Probe(args) => local.block_on(&runtime, linux::probe::probe(args)),
         #[cfg(target_os = "macos")]

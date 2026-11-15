@@ -143,7 +143,7 @@ unsafe fn put(pasteboard: &NSPasteboard, mime: &str, data: &[u8]) -> Result<()> 
 
 
 /// The user sitting at the Mac, if anyone is logged in at the console.
-fn console_user() -> Option<(u32, String)> {
+pub(crate) fn console_user() -> Option<(u32, String)> {
     let uid = std::fs::metadata("/dev/console").ok()?.uid();
     if uid == 0 {
         return None;

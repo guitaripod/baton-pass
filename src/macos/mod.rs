@@ -1,4 +1,5 @@
 mod display;
+pub mod install;
 mod linear;
 pub mod pasteboard;
 mod vhid;

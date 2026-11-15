@@ -50,6 +50,41 @@ pub async fn install(peers: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Stops the service and removes what `install` put in place: the unit, the KWin script and
+/// its shortcut, and the desktop entry. The config and key stay unless `purge` is set; the
+/// binary itself is left for whatever installed it (`cargo uninstall baton-pass`).
+pub async fn uninstall(purge: bool) -> Result<()> {
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    let _ = run("systemctl", &["--user", "disable", "--now", "baton-pass.service"]).await;
+    remove(&home.join(".config/systemd/user/baton-pass.service"))?;
+    let _ = run("systemctl", &["--user", "daemon-reload"]).await;
+    if let Ok(connection) = zbus::Connection::session().await {
+        let scripting = KdeService { name: "org.kde.KWin", path: "/Scripting", interface: "org.kde.kwin.Scripting" };
+        let _ = scripting.call(&connection, "unloadScript", &(SCRIPT_ID,)).await;
+        let accel = KdeService { name: "org.kde.kglobalaccel", path: "/kglobalaccel", interface: "org.kde.KGlobalAccel" };
+        let _ = accel.call(&connection, "unregister", &("kwin", "BatonPassToggle")).await;
+    }
+    let _ = run("kwriteconfig6", &["--file", "kwinrc", "--group", "Plugins", "--key", &format!("{SCRIPT_ID}Enabled"), "--delete"]).await;
+    remove(&home.join(".local/share/kwin/scripts").join(SCRIPT_ID))?;
+    remove(&home.join(".local/share/applications").join(format!("{APP_ID}.desktop")))?;
+    if purge {
+        for dir in [Config::dir(), crate::config::xdg_dir("XDG_STATE_HOME", ".local/state"), crate::config::xdg_dir("XDG_CACHE_HOME", ".cache")] {
+            remove(&dir)?;
+        }
+    }
+    println!("uninstalled{}", if purge { ", config and key removed" } else { "; the config and key stay in ~/.config/baton-pass" });
+    println!("remove the binary with `cargo uninstall baton-pass` or by deleting it");
+    Ok(())
+}
+
+fn remove(path: &Path) -> Result<()> {
+    let result = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+    match result {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error).with_context(|| format!("removing {}", path.display())),
+        _ => Ok(()),
+    }
+}
+
 fn write(path: &Path, contents: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
