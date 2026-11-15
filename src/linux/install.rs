@@ -11,7 +11,7 @@ const SCRIPT_ID: &str = "batonpass";
 
 pub async fn install(peers: Vec<String>) -> Result<()> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
-    let executable = std::env::current_exe()?.canonicalize()?;
+    let executable = settle_executable(&home)?;
 
     let config_path = Config::path();
     if !config_path.exists() {
@@ -48,6 +48,28 @@ pub async fn install(peers: Vec<String>) -> Result<()> {
     println!("installed: baton-pass.service running, hotkey {} registered with KWin", hotkey.qt_name());
     println!("key: {}", Config::key_path().display());
     Ok(())
+}
+
+/// The binary the service will run. One run from a download folder copies itself to
+/// ~/.local/bin first, so the service does not depend on where the archive was unpacked; one
+/// already in ~/.cargo/bin, ~/.local/bin or a system folder stays where it is.
+fn settle_executable(home: &Path) -> Result<PathBuf> {
+    let current = std::env::current_exe()?.canonicalize()?;
+    if is_settled(&current, home) {
+        return Ok(current);
+    }
+    let local = home.join(".local/bin");
+    std::fs::create_dir_all(&local)?;
+    let target = local.join("baton-pass");
+    let staged = local.join(".baton-pass.new");
+    std::fs::copy(&current, &staged).with_context(|| format!("copying to {}", staged.display()))?;
+    std::fs::rename(&staged, &target)?;
+    println!("copied to {}", target.display());
+    Ok(target)
+}
+
+fn is_settled(executable: &Path, home: &Path) -> bool {
+    [home.join(".cargo/bin"), home.join(".local/bin"), PathBuf::from("/usr")].iter().any(|dir| executable.starts_with(dir))
 }
 
 /// Stops the service and removes what `install` put in place: the unit, the KWin script and
@@ -257,6 +279,15 @@ mod tests {
         let updated = with_peers(config, &["10.0.0.2".into(), "mac".into()]);
         assert_eq!(updated, "# comment\npeers = [\"10.0.0.2\", \"mac\"]\nside = \"left\"\n");
         assert!(with_peers("side = \"left\"\n", &["a".into()]).starts_with("peers = [\"a\"]\n"));
+    }
+
+    #[test]
+    fn downloaded_binaries_move_and_installed_ones_stay() {
+        let home = Path::new("/home/someone");
+        assert!(is_settled(Path::new("/home/someone/.cargo/bin/baton-pass"), home));
+        assert!(is_settled(Path::new("/home/someone/.local/bin/baton-pass"), home));
+        assert!(is_settled(Path::new("/usr/bin/baton-pass"), home));
+        assert!(!is_settled(Path::new("/home/someone/Downloads/baton-pass-0.1.0-alpha.1/baton-pass"), home));
     }
 
     #[test]

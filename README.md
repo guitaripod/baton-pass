@@ -20,18 +20,18 @@ KWin InputCapture + libei ── baton-pass ══ encrypted UDP ══ baton-pa
 
 ## Install
 
-The Mac needs Karabiner-Elements (or Karabiner-DriverKit-VirtualHIDDevice).
+From a [release](https://github.com/guitaripod/baton-pass/releases):
 
 ```sh
-scripts/install-arch.sh --peer <mac-lan-ip> --peer <mac-tailnet-name>   # Arch
-scripts/install-mac.sh                                                  # Mac
-sudo baton-pass pair       # Mac: shows an eight-digit code
-baton-pass pair <code>     # Arch
+./baton-pass install --peer <mac-lan-ip>   # desktop: KDE Plasma 6 on Wayland
+sudo ./baton-pass install                  # Mac, with Karabiner-Elements installed
+sudo baton-pass pair                       # Mac: shows an eight-digit code
+baton-pass pair <code>                     # desktop
 ```
 
-On first start, allow KDE's input capture dialog and tick "without asking". Pairing checks the code with SPAKE2 and puts one fresh key on both machines.
+On first start, allow KDE's input capture dialog and tick "without asking". Pairing checks the code with SPAKE2 and puts one fresh key on both machines. `baton-pass uninstall` (with sudo on the Mac) removes it again; `--purge` also removes the key.
 
-`install-mac.sh` signs with a Developer ID when `~/Library/Keychains/baton-pass-signing.keychain-db` exists. A Full Disk Access grant for `/usr/local/bin/baton-pass` then survives updates and lets files from Desktop, Documents and Downloads travel.
+From source, `scripts/install-arch.sh --peer <mac-lan-ip>` and `scripts/install-mac.sh` build and install; the Mac script signs with a Developer ID when `~/Library/Keychains/baton-pass-signing.keychain-db` exists. With a Developer ID signature, a Full Disk Access grant for `/usr/local/bin/baton-pass` survives updates and lets files from Desktop, Documents and Downloads travel.
 
 ## Use
 
