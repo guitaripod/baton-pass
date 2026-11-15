@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn ports_are_replaced_on_every_peer_form() {
-        assert_eq!(with_port("192.168.1.58", 47475), "192.168.1.58:47475");
+        assert_eq!(with_port("192.0.2.10", 47475), "192.0.2.10:47475");
         assert_eq!(with_port("macbook:47474", 47475), "macbook:47475");
         assert_eq!(with_port("fe80::1", 47475), "[fe80::1]:47475");
         assert_eq!(with_port("[fe80::1]:47474", 47475), "[fe80::1]:47475");
