@@ -812,7 +812,7 @@ fn edge_decision(displays: &[Rect], exit: Side, cursor: Point, pushing: Option<(
         .iter()
         .min_by(|a, b| a.distance(cursor).total_cmp(&b.distance(cursor)))
         .expect("displays is not empty");
-    EdgeDecision::Clamp(nearest.clamp(cursor))
+    EdgeDecision::Clamp(nearest.inset(inset).clamp(cursor))
 }
 
 async fn serve_clipboard(mut stream: TcpStream, cipher: Rc<Cipher>, gate: Rc<RefCell<Gate>>) {
@@ -899,7 +899,20 @@ mod tests {
     fn wandering_onto_a_hidden_display_is_pulled_back() {
         let builtin = [rect(0.0, 0.0, 1512.0, 982.0)];
         let decision = edge_decision(&builtin, Side::Right, Point { x: -40.0, y: 300.0 }, Some((-5.0, 0.0)), 2.0);
-        assert_eq!(decision, EdgeDecision::Clamp(Point { x: 0.0, y: 300.0 }));
+        assert_eq!(decision, EdgeDecision::Clamp(Point { x: 2.0, y: 300.0 }));
+    }
+
+    #[test]
+    fn a_cursor_just_past_a_hidden_edge_is_pulled_well_inside() {
+        let builtin = [rect(0.0, 0.0, 1147.0, 745.0)];
+        let ratio = 0.6875;
+        let cursor = Point { x: -0.2, y: 300.0 };
+        let EdgeDecision::Clamp(target) = edge_decision(&builtin, Side::Right, cursor, None, 2.0 + ratio) else {
+            panic!("expected a clamp");
+        };
+        let counts = ((target.x - cursor.x) / ratio).round();
+        assert!(counts >= 1.0);
+        assert!(builtin[0].contains(Point { x: cursor.x + counts * ratio, y: cursor.y }));
     }
 
     #[test]

@@ -54,6 +54,15 @@ impl Rect {
         (clamped.x - point.x).hypot(clamped.y - point.y)
     }
 
+    /// The rect shrunk by `amount` on every side, never past its middle.
+    pub fn inset(&self, amount: f64) -> Rect {
+        let (x, y) = (amount.min(self.size.x / 2.0), amount.min(self.size.y / 2.0));
+        Rect {
+            origin: Point { x: self.origin.x + x, y: self.origin.y + y },
+            size: Point { x: self.size.x - 2.0 * x, y: self.size.y - 2.0 * y },
+        }
+    }
+
     pub fn center(&self) -> Point {
         Point { x: self.origin.x + self.size.x / 2.0, y: self.origin.y + self.size.y / 2.0 }
     }
