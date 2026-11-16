@@ -142,12 +142,14 @@ unsafe fn put(pasteboard: &NSPasteboard, mime: &str, data: &[u8]) -> Result<()> 
 }
 
 
+/// The uid of the user logged in at the console; the console belongs to root at the login window.
+pub(crate) fn console_uid() -> Option<u32> {
+    std::fs::metadata("/dev/console").ok().map(|metadata| metadata.uid()).filter(|uid| *uid != 0)
+}
+
 /// The user sitting at the Mac, if anyone is logged in at the console.
 pub(crate) fn console_user() -> Option<(u32, String)> {
-    let uid = std::fs::metadata("/dev/console").ok()?.uid();
-    if uid == 0 {
-        return None;
-    }
+    let uid = console_uid()?;
     let passwd = unsafe { libc_getpwuid(uid) };
     if passwd.is_null() {
         return None;

@@ -148,6 +148,7 @@ pub async fn run(config: Config) -> Result<()> {
     let mut buffer = vec![0u8; 2048];
     tracing::info!("baton-pass {} listening on {}", env!("CARGO_PKG_VERSION"), config.listen);
     let mut next_tick = tokio::time::Instant::now();
+    let mut lost = None;
     loop {
         let poll = receiver.poll_interval();
         next_tick = next_tick.min(tokio::time::Instant::now() + poll);
@@ -180,13 +181,20 @@ pub async fn run(config: Config) -> Result<()> {
                 receiver.tick().await;
                 report_slow("the periodic tick", started);
                 next_tick = tokio::time::Instant::now() + receiver.poll_interval();
+                lost = receiver.watcher.lost();
+                if lost.is_some() {
+                    break;
+                }
             }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
         }
     }
     receiver.release_all();
-    Ok(())
+    match lost {
+        Some(loss) => bail!("{loss}; exiting so launchd starts a fresh process"),
+        None => Ok(()),
+    }
 }
 
 impl Receiver {
