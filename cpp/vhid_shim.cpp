@@ -58,6 +58,16 @@ extern "C" void batonpass_vhid_start(uint16_t vendor_id, uint16_t product_id, ui
   client->async_start();
 }
 
+extern "C" void batonpass_vhid_stop(void) {
+  if (!client) {
+    return;
+  }
+  delete client;
+  client = nullptr;
+  flags.store(0);
+  pqrs::dispatcher::extra::terminate_shared_dispatcher();
+}
+
 extern "C" uint32_t batonpass_vhid_flags(void) {
   return flags.load();
 }

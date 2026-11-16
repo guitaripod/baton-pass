@@ -35,6 +35,7 @@ const SLOW_HANDLER: Duration = Duration::from_millis(50);
 const LATE_TICK: Duration = Duration::from_millis(150);
 const PARKING_LIMIT: Duration = Duration::from_millis(500);
 const EXIT_ARM_DISTANCE: f64 = 24.0;
+const RELEASE_FLUSH: Duration = Duration::from_millis(50);
 
 /// A calibration in progress. It advances one step per tick, so the receive loop keeps
 /// answering while the cursor makes its out-and-back moves.
@@ -191,6 +192,8 @@ pub async fn run(config: Config) -> Result<()> {
         }
     }
     receiver.release_all();
+    tokio::time::sleep(RELEASE_FLUSH).await;
+    vhid::stop();
     match lost {
         Some(loss) => bail!("{loss}; exiting so launchd starts a fresh process"),
         None => Ok(()),

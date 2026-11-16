@@ -4,6 +4,7 @@ use crate::proto::{
 
 unsafe extern "C" {
     fn batonpass_vhid_start(vendor_id: u16, product_id: u16, country_code: u8);
+    fn batonpass_vhid_stop();
     fn batonpass_vhid_flags() -> u32;
     fn batonpass_vhid_keyboard(modifiers: u8, keys: *const u16, count: usize);
     fn batonpass_vhid_consumer(keys: *const u16, count: usize);
@@ -17,6 +18,13 @@ const ANSI_KEYBOARD: u16 = 0x024f;
 /// uses so macOS never shows its keyboard setup assistant.
 pub fn start() {
     unsafe { batonpass_vhid_start(APPLE_VENDOR, ANSI_KEYBOARD, 0) }
+}
+
+/// Disconnects from Karabiner's daemon and joins the client's threads. Run before the process
+/// exits: left running, they lock mutexes that exit-time destructors have already torn down,
+/// and the process aborts instead of exiting.
+pub fn stop() {
+    unsafe { batonpass_vhid_stop() }
 }
 
 pub fn flags() -> u8 {
