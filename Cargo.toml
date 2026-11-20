@@ -1,6 +1,6 @@
 [package]
 name = "baton-pass"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Carry an Arch KDE desktop's mouse and keyboard over to a Mac, with clipboard sync"
