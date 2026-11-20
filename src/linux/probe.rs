@@ -91,6 +91,7 @@ pub async fn probe(args: ProbeArgs) -> Result<()> {
     let config = Config::load()?;
     let cipher = Rc::new(Cipher::load(&Config::key_path())?);
     let mut link = Link::new(cipher, config.peer_addresses()).await?;
+    link.learn(&super::paths::load());
     let mut buffer = vec![0u8; 2048];
     let deadline = Instant::now() + Duration::from_secs(5);
     while !link.connected() {

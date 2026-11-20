@@ -3,6 +3,7 @@ pub mod control;
 pub mod install;
 mod keymap;
 mod link;
+mod paths;
 mod portal;
 pub mod probe;
 mod slam;
@@ -127,7 +128,8 @@ pub async fn run(config: Config) -> Result<()> {
         .ok();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     tokio::task::spawn_local(clipboard_worker(cipher.clone(), clip_rx));
-    let link = Link::new(cipher, config.peer_addresses()).await?;
+    let mut link = Link::new(cipher, config.peer_addresses()).await?;
+    link.learn(&paths::load());
     let (opened_tx, mut opened) = mpsc::unbounded_channel();
 
     let mut daemon = Daemon {
@@ -396,6 +398,13 @@ impl Daemon {
                 self.link.flags = flags;
                 self.rtt = Some(self.last_heartbeat.elapsed());
                 self.note_stalls(stalls, worst);
+            }
+            Some(Incoming::Message(Msg::Addresses { list })) => {
+                if self.link.learn(&list) {
+                    let described: Vec<String> = list.iter().map(|(address, medium)| format!("{address} ({})", medium.name())).collect();
+                    tracing::info!("the Mac reports its addresses: {}", described.join(", "));
+                    paths::save(&list);
+                }
             }
             Some(Incoming::Message(Msg::Exit { frac })) => {
                 if let Some(capture) = &self.capture {
@@ -708,9 +717,9 @@ impl Daemon {
         let due = self.last_stall_warning.is_none_or(|at| at.elapsed() > STALL_WARNING_INTERVAL);
         if stalls >= STALL_WARNING_COUNT && due {
             self.last_stall_warning = Some(Instant::now());
-            let path = self.link.peer.map(|peer| peer.to_string()).unwrap_or_default();
+            let path = self.link.peer.map(|peer| self.link.describe(peer)).unwrap_or("the link");
             tracing::warn!(
-                "the link to the Mac at {path} stalled {stalls} times in the last minute (worst {worst} ms late); on Wi-Fi this is usually AWDL (AirDrop, Universal Control, Sidecar) taking the Mac's radio off its channel"
+                "the link to the Mac stalled {stalls} times in the last minute (worst {worst} ms late) over {path}; on Wi-Fi this is usually AWDL (AirDrop, Universal Control, Sidecar) taking the Mac's radio off its channel"
             );
             self.note_hiccup(format!("link stalled {stalls} times in a minute, worst {worst} ms"));
         }
@@ -815,7 +824,7 @@ impl Daemon {
         };
         let mut details = Vec::new();
         match self.link.peer.filter(|_| connected) {
-            Some(peer) => details.push(format!("Linked with {}", peer.ip())),
+            Some(peer) => details.push(format!("Linked with {} ({})", peer.ip(), self.link.describe(peer))),
             None => details.push(format!("Trying {}", self.config.peers.join(", "))),
         }
         let (stalls, worst) = self.mac_stalls;
@@ -853,7 +862,8 @@ impl Daemon {
         let mut lines = Vec::new();
         lines.push(match (self.link.token, self.link.peer) {
             (Some(_), Some(peer)) => format!(
-                "link: connected to {peer}, last reply {} ms ago{}",
+                "link: connected to {peer} ({}), last reply {} ms ago{}",
+                self.link.describe(peer),
                 self.link.last_heard.elapsed().as_millis(),
                 self.rtt.map(|rtt| format!(", round trip {:.2} ms", rtt.as_secs_f64() * 1000.0)).unwrap_or_default()
             ),
@@ -865,6 +875,11 @@ impl Daemon {
                 0 => "stalls: none in the last minute".into(),
                 _ => format!("stalls: {stalls} in the last minute, worst {worst} ms late"),
             });
+        }
+        if !self.link.advertised().is_empty() {
+            let described: Vec<String> =
+                self.link.advertised().iter().map(|(address, medium)| format!("{} ({})", address.ip(), medium.name())).collect();
+            lines.push(format!("mac addresses: {}", described.join(", ")));
         }
         if self.link.connected() {
             let flags = self.link.flags;

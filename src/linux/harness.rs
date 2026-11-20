@@ -6,10 +6,10 @@ use super::link::{Incoming, Link};
 use super::{FAILSAFE, HEARTBEAT_CAPTURED, TICK};
 use crate::crypto::{Cipher, Counter};
 use crate::jitter::{KeyLease, Lateness, simulated_repeats};
-use crate::proto::{Envelope, KeyState, Msg};
+use crate::proto::{Envelope, KeyState, Medium, Msg};
 use crate::session::{Admission, Doorman};
 use std::cell::{Cell, RefCell};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -89,11 +89,13 @@ impl FakeKeyboard {
 }
 
 /// The Mac's side: admits datagrams with a `Doorman` and acks every heartbeat, like the daemon.
+/// With `advertise`, it reports those addresses right after every handshake.
 struct FakeMac {
     socket: UdpSocket,
     doorman: RefCell<Doorman>,
     counter: RefCell<Counter>,
     accepted: Cell<usize>,
+    advertise: RefCell<Vec<(SocketAddrV4, Medium)>>,
     keyboard: Option<RefCell<FakeKeyboard>>,
 }
 
@@ -104,6 +106,7 @@ impl FakeMac {
             doorman: RefCell::new(Doorman::new()),
             counter: RefCell::new(Counter::new()),
             accepted: Cell::new(0),
+            advertise: RefCell::new(Vec::new()),
             keyboard: keyboard.map(RefCell::new),
         })
     }
@@ -120,7 +123,15 @@ impl FakeMac {
             let admission = self.doorman.borrow_mut().admit(envelope, from);
             let (to, token, msg) = match admission {
                 Admission::Answer { to, msg } => (to, 0, msg),
-                Admission::Joined { to, welcome } => (to, 0, welcome),
+                Admission::Joined { to, welcome } => {
+                    self.send(&cipher, to, 0, welcome).await;
+                    let list = self.advertise.borrow().clone();
+                    let token = self.doorman.borrow().token().expect("just joined");
+                    if !list.is_empty() {
+                        self.send(&cipher, to, token, Msg::Addresses { list }).await;
+                    }
+                    continue;
+                }
                 Admission::Accept { token, msg } => {
                     self.accepted.set(self.accepted.get() + 1);
                     match msg {
@@ -402,4 +413,52 @@ fn a_held_key_still_repeats_through_wifi_stalls() {
     let repeats: u64 = simulated_repeats(&posts, 4, end, REPEAT_DELAY, REPEAT_INTERVAL).iter().sum();
     assert!(repeats >= 25, "a 1.5 s hold should keep repeating between stalls: {repeats} repeats, {posts:?}");
     assert!(posts.last().is_some_and(|(_, state)| state.keys.is_empty()), "{posts:?}");
+}
+
+#[test]
+fn moves_to_the_wired_address_the_mac_reports() {
+    local(async {
+        let cipher = Rc::new(Cipher::from_secret(KEY));
+        let mac = FakeMac::bind(None).await;
+        let mac_address = mac.socket.local_addr().unwrap();
+        tokio::task::spawn_local(mac.clone().serve(cipher.clone()));
+        let started = Instant::now();
+        let mut relays = Vec::new();
+        for seed in 0..2 {
+            let socket = Rc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            relays.push(socket.local_addr().unwrap());
+            tokio::task::spawn_local(relay(socket, mac_address, Faults::default(), started, seed));
+        }
+        let v4 = |address: SocketAddr| match address {
+            SocketAddr::V4(address) => address,
+            SocketAddr::V6(_) => unreachable!("bound to 127.0.0.1"),
+        };
+        *mac.advertise.borrow_mut() = vec![(v4(relays[0]), Medium::Other), (v4(relays[1]), Medium::Wired)];
+
+        let mut link = Link::new(cipher, vec![relays[0].to_string()]).await.unwrap();
+        link.allow_roaming(true);
+        let mut buffer = [0u8; 2048];
+        let mut ticker = tokio::time::interval(TICK);
+        let mut moved_after = None;
+        while started.elapsed() < Duration::from_secs(6) && moved_after.is_none() {
+            tokio::select! {
+                received = link.recv(&mut buffer) => {
+                    if let Ok((size, from)) = received
+                        && let Some(Incoming::Message(Msg::Addresses { list })) = link.accept(&buffer[..size], from).await
+                    {
+                        link.learn(&list);
+                    }
+                }
+                _ = ticker.tick() => {
+                    link.observe(Instant::now(), TICK * 2);
+                    link.maintain().await;
+                    if link.connected() && link.peer == Some(relays[1]) {
+                        moved_after = Some(started.elapsed());
+                    }
+                }
+            }
+        }
+        assert!(moved_after.is_some_and(|after| after < Duration::from_secs(4)), "{moved_after:?}, on {:?}", link.peer);
+        assert_eq!(link.medium_of(relays[1]), Some(Medium::Wired));
+    });
 }

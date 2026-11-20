@@ -1,20 +1,21 @@
 mod display;
 pub mod install;
+mod interfaces;
 mod keyrepeat;
 mod linear;
 pub mod pasteboard;
 mod vhid;
 
 use crate::clip;
-use crate::config::{Confine, Config, Side};
+use crate::config::{Confine, Config, DEFAULT_PORT, Side};
 use crate::crypto::{Cipher, Counter};
 use crate::jitter::{Backlog, KeyLease, LATE_MOTION, Lateness, StallMeter};
 use crate::session::{Admission, Doorman, Silence};
-use crate::proto::{Envelope, FLAG_ENTERED, KeyState, MAX_CLIPBOARD_FRAME, Msg, read_frame, write_frame};
+use crate::proto::{Envelope, FLAG_ENTERED, KeyState, MAX_CLIPBOARD_FRAME, Medium, Msg, read_frame, write_frame};
 use anyhow::{Context, Result, bail};
 use display::{Point, Rect};
 use std::cell::RefCell;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -39,6 +40,8 @@ const PARKING_LIMIT: Duration = Duration::from_millis(500);
 const EXIT_ARM_DISTANCE: f64 = 24.0;
 const RELEASE_FLUSH: Duration = Duration::from_millis(50);
 const FALLBACK_REPEAT_DELAY: Duration = Duration::from_millis(150);
+const ADDRESS_CHECK: Duration = Duration::from_secs(5);
+const ADDRESS_RESEND: Duration = Duration::from_secs(30);
 const LINK_REPORT: Duration = Duration::from_secs(60);
 const VERSION_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -107,6 +110,11 @@ struct Receiver {
     last_playout: u64,
     stalls: StallMeter,
     last_link_report: Instant,
+    interfaces: interfaces::Interfaces,
+    listen_port: u16,
+    advertised: Vec<(SocketAddrV4, Medium)>,
+    advertised_at: Option<Instant>,
+    addresses_checked: Option<Instant>,
     last_version_warning: Option<Instant>,
 }
 
@@ -164,6 +172,11 @@ pub async fn run(config: Config) -> Result<()> {
         last_playout: 0,
         stalls: StallMeter::default(),
         last_link_report: Instant::now(),
+        interfaces: interfaces::Interfaces::new(),
+        listen_port: config.listen.parse::<SocketAddr>().map_or(DEFAULT_PORT, |address| address.port()),
+        advertised: Vec::new(),
+        advertised_at: None,
+        addresses_checked: None,
         last_version_warning: None,
     };
     receiver.read_repeat_delay();
@@ -255,6 +268,7 @@ impl Receiver {
                 self.lateness.reset();
                 tracing::info!("session with {to}{}", previous.unwrap_or_default());
                 self.reply(to, 0, welcome).await;
+                self.advertise(true).await;
                 return;
             }
             Admission::Accept { token, msg } => (token, msg),
@@ -356,6 +370,34 @@ impl Receiver {
             tracing::info!(
                 "link: {stalls} stalls in the last minute (worst {worst} ms late); {released} held keys let go before they could repeat, {pressed_again} pressed again"
             );
+        }
+    }
+
+    /// Tells the desktop which addresses this Mac has, right after a handshake (`force`), when
+    /// they change, and every half minute in case a report was lost.
+    async fn advertise(&mut self, force: bool) {
+        if !force && self.addresses_checked.is_some_and(|at| at.elapsed() < ADDRESS_CHECK) {
+            return;
+        }
+        self.addresses_checked = Some(Instant::now());
+        let list = self.interfaces.addresses(self.listen_port);
+        let changed = list != self.advertised;
+        let stale = self.advertised_at.is_none_or(|at| at.elapsed() >= ADDRESS_RESEND);
+        if !force && !changed && !stale {
+            return;
+        }
+        if changed {
+            let described: Vec<String> = list.iter().map(|(address, medium)| format!("{} ({})", address.ip(), medium.name())).collect();
+            tracing::info!("addresses: {}", described.join(", "));
+        }
+        self.advertised = list.clone();
+        self.advertised_at = Some(Instant::now());
+        let (token, peer) = {
+            let gate = self.gate.borrow();
+            (gate.doorman.token(), gate.doorman.peer())
+        };
+        if let (Some(token), Some(peer)) = (token, peer) {
+            self.reply(peer, token, Msg::Addresses { list }).await;
         }
     }
 
@@ -652,6 +694,7 @@ impl Receiver {
         self.note_tick();
         self.settle_parking();
         self.check_silence().await;
+        self.advertise(false).await;
         self.report_link(false);
         let ready = vhid::pointing_ready();
         if ready != self.pointer_was_ready {

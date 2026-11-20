@@ -1,5 +1,8 @@
 use crate::clip::Clip;
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 pub const MAX_KEYS: usize = 32;
+pub const MAX_ADDRESSES: usize = 16;
 
 /// IPTOS_LOWDELAY. On Linux it gives the socket interactive priority, which the default fq
 /// queueing discipline serves first: without it, a saturating upload (a torrent client) fills
@@ -11,6 +14,47 @@ pub const FLAG_KEYBOARD_READY: u8 = 2;
 pub const FLAG_POINTING_READY: u8 = 4;
 pub const FLAG_VERSION_MISMATCH: u8 = 8;
 pub const FLAG_ENTERED: u8 = 16;
+
+/// What kind of link one of the Mac's addresses sits on, so the desktop can prefer a cable to
+/// Wi-Fi and Wi-Fi to a tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Medium {
+    Wired,
+    Wireless,
+    Other,
+}
+
+impl Medium {
+    fn to_wire(self) -> u8 {
+        match self {
+            Medium::Wired => 0,
+            Medium::Wireless => 1,
+            Medium::Other => 2,
+        }
+    }
+
+    fn from_wire(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Medium::Wired,
+            1 => Medium::Wireless,
+            2 => Medium::Other,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Medium::Wired => "wired",
+            Medium::Wireless => "wireless",
+            Medium::Other => "other",
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn parse(name: &str) -> Option<Self> {
+        [Medium::Wired, Medium::Wireless, Medium::Other].into_iter().find(|medium| medium.name() == name)
+    }
+}
 
 /// Full keyboard state in HID terms: modifier bits, keyboard-page usages and consumer-page usages.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,6 +82,7 @@ pub enum Msg {
     ClipGet { have: [u8; 32] },
     ClipData { echo: u64, clip: Clip },
     ClipNone { echo: u64 },
+    Addresses { list: Vec<(SocketAddrV4, Medium)> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +178,16 @@ impl Envelope {
                 out.extend_from_slice(&nonce.to_le_bytes());
                 out.extend_from_slice(&challenge.to_le_bytes());
             }
+            Msg::Addresses { list } => {
+                out.push(18);
+                let count = list.len().min(MAX_ADDRESSES);
+                out.push(count as u8);
+                for (address, medium) in &list[..count] {
+                    out.extend_from_slice(&address.ip().octets());
+                    out.extend_from_slice(&address.port().to_le_bytes());
+                    out.push(medium.to_wire());
+                }
+            }
         }
         out
     }
@@ -170,6 +225,7 @@ impl Envelope {
             13 => Msg::ClipNone { echo: reader.u64()? },
             14 => Msg::Challenge { nonce: reader.u64()?, challenge: reader.u64()? },
             15 => Msg::Join { nonce: reader.u64()?, challenge: reader.u64()? },
+            18 => Msg::Addresses { list: reader.addresses()? },
             _ => return None,
         };
         reader.0.is_empty().then_some(Self { token, counter, msg })
@@ -265,6 +321,21 @@ impl<'a> Reader<'a> {
         Some(KeyState { modifiers: self.u8()?, keys: self.usages()?, consumer: self.usages()? })
     }
 
+    fn addresses(&mut self) -> Option<Vec<(SocketAddrV4, Medium)>> {
+        let count = self.u8()? as usize;
+        if count > MAX_ADDRESSES {
+            return None;
+        }
+        (0..count)
+            .map(|_| {
+                let octets: [u8; 4] = self.take(4)?.try_into().ok()?;
+                let port = self.u16()?;
+                let medium = Medium::from_wire(self.u8()?)?;
+                Some((SocketAddrV4::new(Ipv4Addr::from(octets), port), medium))
+            })
+            .collect()
+    }
+
     pub(crate) fn blob(&mut self) -> Option<&'a [u8]> {
         let length = self.u32()? as usize;
         if length > MAX_CLIPBOARD {
@@ -302,6 +373,22 @@ mod tests {
         round_trip(Msg::ClipGet { have: [5; 32] });
         round_trip(Msg::ClipData { echo: 3, clip: vec![("image/png".into(), vec![1, 2, 3])] });
         round_trip(Msg::ClipNone { echo: 3 });
+        round_trip(Msg::Addresses {
+            list: vec![
+                (SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), 47474), Medium::Wired),
+                (SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 47474), Medium::Wireless),
+                (SocketAddrV4::new(Ipv4Addr::new(100, 64, 0, 1), 1), Medium::Other),
+            ],
+        });
+        round_trip(Msg::Addresses { list: Vec::new() });
+    }
+
+    #[test]
+    fn rejects_oversized_address_lists() {
+        let mut encoded = Envelope { token: 1, counter: 2, msg: Msg::Addresses { list: Vec::new() } }.encode();
+        let count_index = encoded.len() - 1;
+        encoded[count_index] = (MAX_ADDRESSES + 1) as u8;
+        assert!(Envelope::decode(&encoded).is_none());
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use crate::crypto::{Cipher, Counter, random_u64};
-use crate::proto::{Envelope, Msg};
+use crate::proto::{Envelope, Medium, Msg};
 use crate::session::Silence;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -12,7 +12,7 @@ const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const NONCE_MEMORY: usize = 4;
 const SEND_WARNING_INTERVAL: Duration = Duration::from_secs(5);
-const ROAM_INTERVAL: Duration = Duration::from_secs(5);
+const ROAM_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The encrypted UDP session with the Mac: handshake, replay protection and liveness.
 pub struct Link {
@@ -35,6 +35,8 @@ pub struct Link {
     last_version_warning: Option<Instant>,
     roam_allowed: bool,
     last_roam: Option<Instant>,
+    roam_next: usize,
+    advertised: Vec<(SocketAddr, Medium)>,
     epoch: Instant,
     sent_since_reply: u32,
     pub flags: u8,
@@ -71,6 +73,8 @@ impl Link {
             last_version_warning: None,
             roam_allowed: false,
             last_roam: None,
+            roam_next: 0,
+            advertised: Vec::new(),
             epoch: Instant::now(),
             sent_since_reply: 0,
             flags: 0,
@@ -81,6 +85,52 @@ impl Link {
     /// packet arrives against it.
     pub fn clock(&self) -> u64 {
         self.epoch.elapsed().as_micros() as u64
+    }
+
+    /// Takes the Mac's list of its own addresses, and returns whether it changed. Each becomes a
+    /// path to try, ranked by its medium.
+    pub fn learn(&mut self, list: &[(SocketAddrV4, Medium)]) -> bool {
+        let learned: Vec<(SocketAddr, Medium)> = list.iter().map(|(address, medium)| (SocketAddr::V4(*address), *medium)).collect();
+        if learned == self.advertised {
+            return false;
+        }
+        self.advertised = learned;
+        true
+    }
+
+    pub fn advertised(&self) -> &[(SocketAddr, Medium)] {
+        &self.advertised
+    }
+
+    /// The medium the Mac reported for one of its addresses.
+    pub fn medium_of(&self, address: SocketAddr) -> Option<Medium> {
+        self.advertised.iter().find(|(known, _)| *known == address).map(|(_, medium)| *medium)
+    }
+
+    /// How strongly a path is preferred, lowest first: a Mac address on a cable, then the first
+    /// configured peer, then the Mac's Wi-Fi, then the rest (the tailnet and other tunnels).
+    /// What the Mac reports about an address outranks where it sits in the config.
+    fn rank(&self, address: SocketAddr) -> u8 {
+        match self.medium_of(address) {
+            Some(Medium::Wired) => 0,
+            Some(Medium::Wireless) => 2,
+            Some(Medium::Other) => 3,
+            None if self.peers.first().and_then(|peer| self.known_address(peer)) == Some(address) => 1,
+            None => 3,
+        }
+    }
+
+    /// Every path to the Mac, best first: the configured peers and the addresses it reported.
+    fn candidates(&self) -> Vec<SocketAddr> {
+        let mut list: Vec<SocketAddr> = Vec::new();
+        let configured = self.peers.iter().filter_map(|peer| self.address_of(peer));
+        for address in configured.chain(self.advertised.iter().map(|(address, _)| *address)) {
+            if !list.contains(&address) {
+                list.push(address);
+            }
+        }
+        list.sort_by_key(|address| self.rank(*address));
+        list
     }
 
     pub fn cipher(&self) -> Rc<Cipher> {
@@ -129,8 +179,8 @@ impl Link {
         }
     }
 
-    /// Greets one configured peer per interval, in order, so the wired address wins whenever it
-    /// answers and the tailnet name is only a fallback; drops a session that went silent.
+    /// Greets one path per interval, best first, so a cable wins whenever it answers and the
+    /// tailnet is only a fallback; drops a session that went silent.
     pub async fn maintain(&mut self) {
         if self.connected() && self.quiet() > IDLE_TIMEOUT {
             let reason = format!("no reply for 3 s ({} packets sent since the last one)", self.sent_since_reply);
@@ -144,32 +194,37 @@ impl Link {
             return;
         }
         self.last_hello = Some(Instant::now());
-        if self.peers.is_empty() {
+        let candidates = self.candidates();
+        if candidates.is_empty() {
             return;
         }
+        let address = candidates[self.next_peer % candidates.len()];
+        self.next_peer = self.next_peer.wrapping_add(1);
         let packet = self.hello();
-        let peer = self.peers[self.next_peer % self.peers.len()].clone();
-        self.next_peer = (self.next_peer + 1) % self.peers.len();
-        if let Some(address) = self.address_of(&peer)
-            && let Err(error) = self.socket.send_to(&packet, address).await
-        {
+        if let Err(error) = self.socket.send_to(&packet, address).await {
             tracing::debug!("hello to {address}: {error}");
         }
     }
 
-    /// Linked through a fallback (the tailnet) while the first configured peer (the wired
-    /// address) may be back: greets the first peer now and then, and a completed handshake
-    /// with it moves the session over.
+    /// Linked through a lesser path (Wi-Fi, the tailnet) while a better one may answer: greets
+    /// the better paths in turn, one per interval so their handshakes never cross, and a
+    /// completed handshake moves the session over.
     async fn roam(&mut self) {
-        let Some(first) = self.peers.first().cloned() else { return };
-        let Some(preferred) = self.address_of(&first) else { return };
-        if !self.roam_allowed || self.peer == Some(preferred) || self.last_roam.is_some_and(|at| at.elapsed() < ROAM_INTERVAL) {
+        let Some(current) = self.peer else { return };
+        if !self.roam_allowed || self.last_roam.is_some_and(|at| at.elapsed() < ROAM_INTERVAL) {
+            return;
+        }
+        let current_rank = self.rank(current);
+        let better: Vec<SocketAddr> = self.candidates().into_iter().filter(|address| self.rank(*address) < current_rank).collect();
+        if better.is_empty() {
             return;
         }
         self.last_roam = Some(Instant::now());
+        let target = better[self.roam_next % better.len()];
+        self.roam_next = self.roam_next.wrapping_add(1);
         let packet = self.hello();
-        if let Err(error) = self.socket.send_to(&packet, preferred).await {
-            tracing::debug!("hello to {preferred}: {error}");
+        if let Err(error) = self.socket.send_to(&packet, target).await {
+            tracing::debug!("hello to {target}: {error}");
         }
     }
 
@@ -184,9 +239,14 @@ impl Link {
     }
 
     /// Whether a handshake packet from `from` may proceed: always when unlinked, and from a
-    /// better address than the current one while roaming is allowed.
+    /// better path than the current one while roaming is allowed.
     fn may_handshake(&self, from: SocketAddr) -> bool {
-        !self.connected() || (self.roam_allowed && self.peer != Some(from))
+        !self.connected() || (self.roam_allowed && self.peer.is_some_and(|peer| peer != from && self.rank(from) < self.rank(peer)))
+    }
+
+    /// A configured peer's address as far as it is known now: literal, or resolved earlier.
+    fn known_address(&self, peer: &str) -> Option<SocketAddr> {
+        peer.parse::<SocketAddr>().ok().or_else(|| self.resolved.borrow().get(peer).copied())
     }
 
     /// The address for a configured peer. Literal addresses are used as they are; names are
@@ -196,7 +256,7 @@ impl Link {
         if let Ok(address) = peer.parse::<SocketAddr>() {
             return Some(address);
         }
-        let cached = self.resolved.borrow().get(peer).copied();
+        let cached = self.known_address(peer);
         let resolved = self.resolved.clone();
         let name = peer.to_string();
         tokio::task::spawn_local(async move {
@@ -222,6 +282,16 @@ impl Link {
                 "{from} speaks Baton Pass wire version {version} and this desktop speaks {}: update both machines to the same release",
                 crate::crypto::WIRE_VERSION
             );
+        }
+    }
+
+    /// What a path is, for logs and status: the medium the Mac reported for it, if any.
+    pub fn describe(&self, address: SocketAddr) -> &'static str {
+        match self.medium_of(address) {
+            Some(Medium::Wired) => "the Mac's wired address",
+            Some(Medium::Wireless) => "the Mac's Wi-Fi address",
+            Some(Medium::Other) => "a tunnel or other link",
+            None => "a configured peer",
         }
     }
 
@@ -270,7 +340,7 @@ impl Link {
             }
             Msg::Welcome { nonce, token } if self.may_handshake(from) && self.joining == Some((from, nonce)) => {
                 if let Some(previous) = self.peer.filter(|_| self.connected()) {
-                    tracing::info!("moving the link from {previous} to {from}");
+                    tracing::info!("moving the link from {previous} ({}) to {from} ({})", self.describe(previous), self.describe(from));
                 }
                 self.token = Some(token);
                 self.peer = Some(from);
