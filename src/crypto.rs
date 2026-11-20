@@ -6,7 +6,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const HEADER: [u8; 3] = *b"BP\x01";
+/// The wire version, the last header byte. Version 2 stamps input with the desktop's clock.
+pub const WIRE_VERSION: u8 = 2;
+const HEADER: [u8; 3] = [b'B', b'P', WIRE_VERSION];
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 pub const OVERHEAD: usize = HEADER.len() + NONCE_LEN + TAG_LEN;
@@ -88,6 +90,12 @@ pub fn write_key(path: &Path, key: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
+/// The wire version a datagram that failed to open was sealed with, when it is a Baton Pass
+/// datagram of another version: the other machine runs an older or newer release.
+pub fn foreign_version(packet: &[u8]) -> Option<u8> {
+    (packet.len() >= HEADER.len() && packet[..2] == HEADER[..2] && packet[2] != WIRE_VERSION).then(|| packet[2])
+}
+
 pub fn random_u64() -> u64 {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("system randomness");
@@ -157,7 +165,7 @@ mod tests {
         packet[last] ^= 1;
         assert!(cipher.open(&packet).is_none());
         let mut header = cipher.seal(b"hello");
-        header[2] = 2;
+        header[2] = WIRE_VERSION ^ 0xff;
         assert!(cipher.open(&header).is_none());
     }
 
@@ -166,6 +174,16 @@ mod tests {
         let packet = cipher().seal(b"hello");
         let other = Cipher(XChaCha20Poly1305::new(&[8u8; 32].into()));
         assert!(other.open(&packet).is_none());
+    }
+
+    #[test]
+    fn spots_datagrams_of_another_wire_version() {
+        let mut packet = cipher().seal(b"hello");
+        assert_eq!(foreign_version(&packet), None);
+        packet[2] = 1;
+        assert_eq!(foreign_version(&packet), Some(1));
+        assert_eq!(foreign_version(b"XYZ"), None);
+        assert_eq!(foreign_version(b"BP"), None);
     }
 
     #[test]

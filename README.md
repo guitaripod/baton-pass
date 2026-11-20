@@ -13,6 +13,7 @@ KWin InputCapture + libei ── baton-pass ══ encrypted UDP ══ baton-pa
 
 - **Capture.** KDE's InputCapture portal hands over all input once the pointer crosses a barrier on the desktop edge; the hotkey pushes the pointer into it with a private uinput mouse. KWin's Meta+Shift+Esc always takes input back.
 - **Link.** One XChaCha20-Poly1305 datagram per input frame, about 0.25 ms round trip on wired gigabit, with a fresh session per handshake and replay protection. Every packet carries the full key and button state, so nothing gets stuck.
+- **Wi-Fi.** On Wi-Fi the Mac's radio leaves its channel for AWDL (AirDrop, Universal Control, Sidecar) about twice a second and delivers 100 to 140 ms of input at once. Input is stamped with the desktop's clock so the Mac can tell late from on time. The desktop restates held keys every 10 ms and the Mac holds a key only while that keeps coming: one nobody vouches for is let go just before macOS's key repeat would start, so a release stuck in a stall never types a run of repeats. A late burst of motion glides out over a few frames instead of jumping, and clicks still land where they were aimed. `baton-pass status` counts the stalls.
 - **Gaps.** A short silence releases held keys but keeps control; input returns to the desktop after 1.5 s and the link drops after 3 s. Each side counts only time its own loop was running. The link prefers the wired address and moves back to it from the tailnet.
 - **Pointer.** One HID report per mouse report, several per 120 Hz frame, with acceleration off and a calibration that makes one desktop pixel one Mac point.
 - **Clipboard.** Text, HTML, RTF and PNG both ways, and files and folders up to 32 MB between Dolphin and Finder.
@@ -29,14 +30,14 @@ sudo baton-pass pair                       # Mac: shows an eight-digit code
 baton-pass pair <code>                     # desktop
 ```
 
-On first start, allow KDE's input capture dialog and tick "without asking". Pairing checks the code with SPAKE2 and puts one fresh key on both machines. `baton-pass uninstall` (with sudo on the Mac) removes it again; `--purge` also removes the key.
+Both machines must run the same release: each logs it when the other speaks an older or newer wire version. On first start, allow KDE's input capture dialog and tick "without asking". Pairing checks the code with SPAKE2 and puts one fresh key on both machines. `baton-pass uninstall` (with sudo on the Mac) removes it again; `--purge` also removes the key.
 
 From source, `scripts/install-arch.sh --peer <mac-lan-ip>` and `scripts/install-mac.sh` build and install; the Mac script signs with a Developer ID when `~/Library/Keychains/baton-pass-signing.keychain-db` exists. With a Developer ID signature, a Full Disk Access grant for `/usr/local/bin/baton-pass` survives updates and lets files from Desktop, Documents and Downloads travel.
 
 ## Use
 
-- `baton-pass status`: link and round trip, the Mac's virtual devices, capture state, recent hiccups.
-- `baton-pass probe`: tests the Mac side without touching local input (`--moves`, `--cross`, `--wheel 120`, `--shift`, `--clip <text>`). Stop the service first.
+- `baton-pass status`: link and round trip, stalls in the last minute, the Mac's virtual devices, capture state, recent hiccups.
+- `baton-pass probe`: tests the Mac side without touching local input (`--moves`, `--cross`, `--wheel 120`, `--shift`, `--taps 40`, `--clip <text>`). Stop the service first.
 
 ## Configuration
 

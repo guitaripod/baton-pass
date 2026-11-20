@@ -1,6 +1,8 @@
 mod clip;
 mod config;
 mod crypto;
+#[cfg(any(target_os = "macos", test))]
+mod jitter;
 mod pair;
 mod proto;
 mod session;

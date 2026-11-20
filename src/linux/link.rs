@@ -32,8 +32,10 @@ pub struct Link {
     silence: Silence,
     resolved: Rc<RefCell<HashMap<String, SocketAddr>>>,
     last_send_warning: Option<Instant>,
+    last_version_warning: Option<Instant>,
     roam_allowed: bool,
     last_roam: Option<Instant>,
+    epoch: Instant,
     sent_since_reply: u32,
     pub flags: u8,
 }
@@ -66,11 +68,19 @@ impl Link {
             silence: Silence::default(),
             resolved: Rc::new(RefCell::new(HashMap::new())),
             last_send_warning: None,
+            last_version_warning: None,
             roam_allowed: false,
             last_roam: None,
+            epoch: Instant::now(),
             sent_since_reply: 0,
             flags: 0,
         })
+    }
+
+    /// This side's clock for stamping input, in microseconds. The Mac measures how late each
+    /// packet arrives against it.
+    pub fn clock(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
     }
 
     pub fn cipher(&self) -> Rc<Cipher> {
@@ -202,6 +212,19 @@ impl Link {
         cached
     }
 
+    /// Says, now and then, that the Mac answers in another wire version: one machine was
+    /// updated and the other was not, and they cannot talk until both run the same release.
+    fn note_foreign_version(&mut self, packet: &[u8], from: SocketAddr) {
+        let Some(version) = crate::crypto::foreign_version(packet) else { return };
+        if self.last_version_warning.is_none_or(|at| at.elapsed() > SEND_WARNING_INTERVAL * 12) {
+            self.last_version_warning = Some(Instant::now());
+            tracing::warn!(
+                "{from} speaks Baton Pass wire version {version} and this desktop speaks {}: update both machines to the same release",
+                crate::crypto::WIRE_VERSION
+            );
+        }
+    }
+
     pub async fn send(&mut self, msg: Msg) {
         let (Some(token), Some(peer)) = (self.token, self.peer) else { return };
         self.sent_since_reply += 1;
@@ -231,7 +254,11 @@ impl Link {
     /// The handshake is Hello, Challenge, Join, Welcome: the Mac only opens a session for a Join
     /// that answers its latest single-use challenge, so replayed handshake packets open nothing.
     pub async fn accept(&mut self, packet: &[u8], from: SocketAddr) -> Option<Incoming> {
-        let envelope = Envelope::decode(&self.cipher.open(packet)?)?;
+        let Some(plain) = self.cipher.open(packet) else {
+            self.note_foreign_version(packet, from);
+            return None;
+        };
+        let envelope = Envelope::decode(&plain)?;
         match envelope.msg {
             Msg::Challenge { nonce, challenge } if self.may_handshake(from) && self.nonces.contains(&nonce) => {
                 self.joining = Some((from, nonce));

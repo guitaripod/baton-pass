@@ -50,6 +50,10 @@ const HICCUP_MEMORY: usize = 20;
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(1);
 const SLOW_HANDLER: Duration = Duration::from_millis(50);
 const LATE_TICK: Duration = Duration::from_millis(150);
+const KEY_REFRESH: Duration = Duration::from_millis(10);
+const KEY_TRAILING: u8 = 2;
+const STALL_WARNING_INTERVAL: Duration = Duration::from_secs(600);
+const STALL_WARNING_COUNT: u16 = 20;
 
 struct Capture {
     activation_id: Option<u32>,
@@ -104,6 +108,9 @@ struct Daemon {
     rtt: Option<Duration>,
     hiccups: VecDeque<(Instant, String)>,
     was_connected: bool,
+    key_refresh: KeyRefresh,
+    mac_stalls: (u16, u16),
+    last_stall_warning: Option<Instant>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -147,6 +154,9 @@ pub async fn run(config: Config) -> Result<()> {
         rtt: None,
         hiccups: VecDeque::new(),
         was_connected: false,
+        key_refresh: KeyRefresh::default(),
+        mac_stalls: (0, 0),
+        last_stall_warning: None,
     };
     match tray::Tray::start(&daemon.bus, requests_tx_for_tray, daemon.look()).await {
         Ok(tray) => daemon.tray = Some(tray),
@@ -238,6 +248,9 @@ pub async fn run(config: Config) -> Result<()> {
                     None => {}
                 }
             }
+            _ = sleep_until(daemon.key_refresh.due()) => {
+                daemon.refresh_keys().await;
+            }
             request = requests.recv() => match request {
                 Some(Request::Toggle(position)) => {
                     if daemon.portal.is_none() {
@@ -274,6 +287,46 @@ pub async fn run(config: Config) -> Result<()> {
     }
     daemon.shutdown().await;
     Ok(())
+}
+
+/// When the held keys go out again. The Mac holds a key only while the desktop keeps restating
+/// it, so a release stuck in a Wi-Fi stall can never turn into a run of repeats: every
+/// `KEY_REFRESH` while a key that repeats is down, and `KEY_TRAILING` more times after the last
+/// one is let go, in case that release was lost.
+#[derive(Default)]
+pub(crate) struct KeyRefresh(Option<(Instant, u8)>);
+
+impl KeyRefresh {
+    pub(crate) fn due(&self) -> Option<Instant> {
+        self.0.map(|(at, _)| at)
+    }
+
+    /// The keys just changed and went out.
+    pub(crate) fn changed(&mut self) {
+        self.0 = Some((Instant::now() + KEY_REFRESH, KEY_TRAILING));
+    }
+
+    /// `keys` are being restated now; plans the next time.
+    pub(crate) fn sent(&mut self, keys: &crate::proto::KeyState) {
+        let repeating = !keys.keys.is_empty() || !keys.consumer.is_empty();
+        let next = Instant::now() + KEY_REFRESH;
+        self.0 = match (repeating, self.0.map_or(0, |(_, trailing)| trailing)) {
+            (true, _) => Some((next, KEY_TRAILING)),
+            (false, 0) => None,
+            (false, left) => Some((next, left - 1)),
+        };
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.0 = None;
+    }
+}
+
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => pending().await,
+    }
 }
 
 async fn next_ei(ei: &mut Option<Ei>) -> Option<Result<EiEvent, reis::Error>> {
@@ -339,9 +392,10 @@ impl Daemon {
                 self.rearm_at = Some(Instant::now());
                 self.last_heartbeat = Instant::now() - HEARTBEAT_IDLE;
             }
-            Some(Incoming::Message(Msg::Ack { flags })) => {
+            Some(Incoming::Message(Msg::Ack { flags, stalls, worst })) => {
                 self.link.flags = flags;
                 self.rtt = Some(self.last_heartbeat.elapsed());
+                self.note_stalls(stalls, worst);
             }
             Some(Incoming::Message(Msg::Exit { frac })) => {
                 if let Some(capture) = &self.capture {
@@ -456,7 +510,9 @@ impl Daemon {
                 let changed = if pressed { capture.pressed.insert(key.key) } else { capture.pressed.remove(&key.key) };
                 if changed {
                     let state = keymap::key_state(&capture.pressed, self.config.swap_alt_meta);
-                    self.link.send(Msg::Keys(state)).await;
+                    let at = self.link.clock();
+                    self.link.send(Msg::Keys { keys: state, at }).await;
+                    self.key_refresh.changed();
                 }
             }
             EiEvent::Disconnected(disconnected) => tracing::warn!("ei disconnected: {:?}", disconnected.reason),
@@ -510,6 +566,7 @@ impl Daemon {
             wheel_v: wheel_v as i32,
             wheel_h: wheel_h as i32,
             buttons: capture.buttons,
+            at: self.link.clock(),
         };
         capture.motion = (0.0, 0.0);
         capture.wheel = (capture.wheel.0 - wheel_v, capture.wheel.1 - wheel_h);
@@ -629,7 +686,34 @@ impl Daemon {
             Some(capture) => (true, keymap::key_state(&capture.pressed, self.config.swap_alt_meta), capture.buttons),
             None => (false, Default::default(), 0),
         };
-        self.link.send(Msg::Heartbeat { entered, keys, buttons }).await;
+        let at = self.link.clock();
+        self.link.send(Msg::Heartbeat { entered, keys, buttons, at }).await;
+    }
+
+    async fn refresh_keys(&mut self) {
+        let Some(capture) = &self.capture else {
+            self.key_refresh.stop();
+            return;
+        };
+        let keys = keymap::key_state(&capture.pressed, self.config.swap_alt_meta);
+        self.key_refresh.sent(&keys);
+        let at = self.link.clock();
+        self.link.send(Msg::Keys { keys, at }).await;
+    }
+
+    /// Keeps the Mac's count of link stalls for status, and says once in a while when they
+    /// are frequent enough to be felt.
+    fn note_stalls(&mut self, stalls: u16, worst: u16) {
+        self.mac_stalls = (stalls, worst);
+        let due = self.last_stall_warning.is_none_or(|at| at.elapsed() > STALL_WARNING_INTERVAL);
+        if stalls >= STALL_WARNING_COUNT && due {
+            self.last_stall_warning = Some(Instant::now());
+            let path = self.link.peer.map(|peer| peer.to_string()).unwrap_or_default();
+            tracing::warn!(
+                "the link to the Mac at {path} stalled {stalls} times in the last minute (worst {worst} ms late); on Wi-Fi this is usually AWDL (AirDrop, Universal Control, Sidecar) taking the Mac's radio off its channel"
+            );
+            self.note_hiccup(format!("link stalled {stalls} times in a minute, worst {worst} ms"));
+        }
     }
 
     /// Reads every datagram already waiting. Run before judging the Mac silent, so replies left
@@ -734,6 +818,10 @@ impl Daemon {
             Some(peer) => details.push(format!("Linked with {}", peer.ip())),
             None => details.push(format!("Trying {}", self.config.peers.join(", "))),
         }
+        let (stalls, worst) = self.mac_stalls;
+        if connected && stalls > 0 {
+            details.push(format!("{stalls} link stalls in the last minute, worst {worst} ms"));
+        }
         details.push(format!("{} switches", self.hotkey.qt_name()));
         let hour = Duration::from_secs(3600);
         let recent = self.hiccups.iter().filter(|(at, _)| at.elapsed() < hour).count();
@@ -771,6 +859,13 @@ impl Daemon {
             ),
             _ => format!("link: looking for {}", self.config.peer_addresses().join(", ")),
         });
+        if self.link.connected() {
+            let (stalls, worst) = self.mac_stalls;
+            lines.push(match stalls {
+                0 => "stalls: none in the last minute".into(),
+                _ => format!("stalls: {stalls} in the last minute, worst {worst} ms late"),
+            });
+        }
         if self.link.connected() {
             let flags = self.link.flags;
             let mut mac = Vec::new();

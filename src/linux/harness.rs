@@ -1,17 +1,19 @@
 //! End-to-end link tests: the desktop's real `Link` against the Mac's real `Doorman`, over
-//! localhost UDP through a relay that loses, duplicates, delays (and so reorders) and blacks
-//! out datagrams, driven like the daemon drives them.
+//! localhost UDP through a relay that loses, duplicates, delays (and so reorders), blacks out
+//! and stalls datagrams, driven like the daemon drives them.
 
 use super::link::{Incoming, Link};
 use super::{FAILSAFE, HEARTBEAT_CAPTURED, TICK};
 use crate::crypto::{Cipher, Counter};
-use crate::proto::{Envelope, Msg};
+use crate::jitter::{KeyLease, Lateness, simulated_repeats};
+use crate::proto::{Envelope, KeyState, Msg};
 use crate::session::{Admission, Doorman};
 use std::cell::{Cell, RefCell};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 const KEY: [u8; 32] = [42; 32];
 
@@ -22,6 +24,7 @@ struct Faults {
     duplicate: f64,
     max_delay: Duration,
     blackout: Option<(Duration, Duration)>,
+    stall: Option<(Duration, Duration)>,
 }
 
 /// A small seeded generator, so a failing run fails the same way again.
@@ -36,15 +39,80 @@ impl Dice {
     }
 }
 
+/// The key repeat the fake Mac plays back: its owner's settings, 166 ms then every 16.7 ms.
+const REPEAT_DELAY: u64 = 166_667;
+const REPEAT_INTERVAL: u64 = 16_667;
+
+/// The Mac daemon's keyboard path: every key state the desktop sends goes through the lease,
+/// or straight to the "HID device" without it, and each state posted is recorded with the
+/// Mac's time so the key repeat macOS would produce can be counted afterwards.
+struct FakeKeyboard {
+    leased: bool,
+    epoch: Instant,
+    lateness: Lateness,
+    lease: KeyLease,
+    posts: Vec<(u64, KeyState)>,
+}
+
+impl FakeKeyboard {
+    fn new(leased: bool) -> Self {
+        Self { leased, epoch: Instant::now(), lateness: Lateness::default(), lease: KeyLease::default(), posts: vec![(0, KeyState::default())] }
+    }
+
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
+    }
+
+    fn post(&mut self, at: u64, state: KeyState) {
+        if self.posts.last().map(|(_, last)| last) != Some(&state) {
+            self.posts.push((at, state));
+        }
+    }
+
+    fn receive(&mut self, keys: KeyState, at: u64) {
+        let now = self.now();
+        self.lateness.observe(at, now);
+        let desktop_now = self.lateness.desktop_now(now).unwrap_or(at);
+        let state = if self.leased { self.lease.confirm(keys, at, now, desktop_now, REPEAT_DELAY) } else { keys };
+        self.post(now, state);
+    }
+
+    fn tick(&mut self) {
+        let now = self.now();
+        if self.leased
+            && let Some(desktop_now) = self.lateness.desktop_now(now)
+            && let Some(state) = self.lease.expire(now, desktop_now, REPEAT_DELAY)
+        {
+            self.post(now, state);
+        }
+    }
+}
+
 /// The Mac's side: admits datagrams with a `Doorman` and acks every heartbeat, like the daemon.
 struct FakeMac {
     socket: UdpSocket,
     doorman: RefCell<Doorman>,
     counter: RefCell<Counter>,
     accepted: Cell<usize>,
+    keyboard: Option<RefCell<FakeKeyboard>>,
 }
 
 impl FakeMac {
+    async fn bind(keyboard: Option<FakeKeyboard>) -> Rc<Self> {
+        Rc::new(FakeMac {
+            socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            doorman: RefCell::new(Doorman::new()),
+            counter: RefCell::new(Counter::new()),
+            accepted: Cell::new(0),
+            keyboard: keyboard.map(RefCell::new),
+        })
+    }
+
+    async fn send(&self, cipher: &Cipher, to: SocketAddr, token: u64, msg: Msg) {
+        let counter = self.counter.borrow_mut().next();
+        let _ = self.socket.send_to(&cipher.seal(&Envelope { token, counter, msg }.encode()), to).await;
+    }
+
     async fn serve(self: Rc<Self>, cipher: Rc<Cipher>) {
         let mut buffer = [0u8; 2048];
         while let Ok((length, from)) = self.socket.recv_from(&mut buffer).await {
@@ -56,14 +124,37 @@ impl FakeMac {
                 Admission::Accept { token, msg } => {
                     self.accepted.set(self.accepted.get() + 1);
                     match msg {
-                        Msg::Heartbeat { .. } => (from, token, Msg::Ack { flags: 0 }),
+                        Msg::Heartbeat { entered, keys, at, .. } => {
+                            if let Some(keyboard) = &self.keyboard
+                                && entered
+                            {
+                                keyboard.borrow_mut().receive(keys, at);
+                            }
+                            (from, token, Msg::Ack { flags: 0, stalls: 0, worst: 0 })
+                        }
+                        Msg::Keys { keys, at } => {
+                            if let Some(keyboard) = &self.keyboard {
+                                keyboard.borrow_mut().receive(keys, at);
+                            }
+                            continue;
+                        }
                         _ => continue,
                     }
                 }
                 Admission::Ignore => continue,
             };
-            let counter = self.counter.borrow_mut().next();
-            let _ = self.socket.send_to(&cipher.seal(&Envelope { token, counter, msg }.encode()), to).await;
+            self.send(&cipher, to, token, msg).await;
+        }
+    }
+
+    /// Ticks the keyboard every 4 ms, like the Mac daemon's loop while it has control.
+    async fn tick_keyboard(self: Rc<Self>) {
+        let mut ticker = tokio::time::interval(Duration::from_millis(4));
+        loop {
+            ticker.tick().await;
+            if let Some(keyboard) = &self.keyboard {
+                keyboard.borrow_mut().tick();
+            }
         }
     }
 
@@ -73,10 +164,20 @@ impl FakeMac {
     }
 }
 
-/// Forwards between the desktop and the Mac, applying `faults`.
+/// Forwards between the desktop and the Mac, applying `faults`. A stall holds every datagram
+/// sent while it lasts and releases them in order when it ends, the way the Mac's Wi-Fi does
+/// while AWDL has its radio on another channel.
 async fn relay(socket: Rc<UdpSocket>, mac: SocketAddr, faults: Faults, started: Instant, seed: u64) {
     let desktop: Rc<Cell<Option<SocketAddr>>> = Rc::new(Cell::new(None));
     let mut dice = Dice(seed);
+    let (held, mut releases) = mpsc::unbounded_channel::<(Instant, SocketAddr, Vec<u8>)>();
+    let forwarder = socket.clone();
+    tokio::task::spawn_local(async move {
+        while let Some((at, to, packet)) = releases.recv().await {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+            let _ = forwarder.send_to(&packet, to).await;
+        }
+    });
     let mut buffer = [0u8; 2048];
     while let Ok((length, from)) = socket.recv_from(&mut buffer).await {
         let to = if from == mac {
@@ -90,6 +191,12 @@ async fn relay(socket: Rc<UdpSocket>, mac: SocketAddr, faults: Faults, started: 
         };
         let elapsed = started.elapsed();
         if faults.blackout.is_some_and(|(from, until)| elapsed >= from && elapsed < until) || dice.roll() < faults.loss {
+            continue;
+        }
+        if let Some((period, stalled)) = faults.stall {
+            let phase = Duration::from_nanos((elapsed.as_nanos() % period.as_nanos()) as u64);
+            let release = if phase < stalled { Instant::now() + (stalled - phase) } else { Instant::now() };
+            let _ = held.send((release, to, buffer[..length].to_vec()));
             continue;
         }
         let copies = if dice.roll() < faults.duplicate { 2 } else { 1 };
@@ -134,12 +241,7 @@ async fn drive_paths(
     during: impl Fn(Duration, &FakeMac),
 ) -> (Run, Rc<FakeMac>, (Vec<SocketAddr>, Option<SocketAddr>)) {
     let cipher = Rc::new(Cipher::from_secret(KEY));
-    let mac = Rc::new(FakeMac {
-        socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
-        doorman: RefCell::new(Doorman::new()),
-        counter: RefCell::new(Counter::new()),
-        accepted: Cell::new(0),
-    });
+    let mac = FakeMac::bind(None).await;
     let mac_address = mac.socket.local_addr().unwrap();
     tokio::task::spawn_local(mac.clone().serve(cipher.clone()));
     let started = Instant::now();
@@ -186,7 +288,8 @@ async fn drive_paths(
                     if last_heartbeat.elapsed() >= HEARTBEAT_CAPTURED {
                         last_heartbeat = Instant::now();
                         run.heartbeats += 1;
-                        link.send(Msg::Heartbeat { entered: true, keys: Default::default(), buttons: 0 }).await;
+                        let at = link.clock();
+                        link.send(Msg::Heartbeat { entered: true, keys: Default::default(), buttons: 0, at }).await;
                     }
                 }
                 during(started.elapsed(), &mac);
@@ -248,4 +351,55 @@ fn moves_back_to_the_wired_path_once_it_answers() {
     let (run, _, (relays, ended_on)) = local(drive_paths(&[wired_down, Faults::default()], Duration::from_secs(9), 17, |_, _| {}));
     assert_eq!(ended_on, Some(relays[0]), "{run:?}");
     assert_eq!((run.links, run.drops, run.failsafe_trips), (2, 0, 0), "{run:?}");
+}
+
+/// Types on the desktop through a link that stalls like Wi-Fi under AWDL: 130 ms every
+/// 524 ms, with `probe::tap`, which sends keys the way the daemon does. Returns the key states
+/// the fake Mac posted and how long the run lasted on its clock.
+async fn type_through_stalls(leased: bool, taps: usize, hold: Duration) -> (Vec<(u64, KeyState)>, u64) {
+    let cipher = Rc::new(Cipher::from_secret(KEY));
+    let mac = FakeMac::bind(Some(FakeKeyboard::new(leased))).await;
+    let mac_address = mac.socket.local_addr().unwrap();
+    tokio::task::spawn_local(mac.clone().serve(cipher.clone()));
+    tokio::task::spawn_local(mac.clone().tick_keyboard());
+    let relay_socket = Rc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_address = relay_socket.local_addr().unwrap();
+    let stall = Some((Duration::from_millis(524), Duration::from_millis(130)));
+    tokio::task::spawn_local(relay(relay_socket, mac_address, Faults { stall, ..Default::default() }, Instant::now(), 1));
+
+    let mut link = Link::new(cipher, vec![relay_address.to_string()]).await.unwrap();
+    let mut buffer = [0u8; 2048];
+    while !link.connected() {
+        link.observe(Instant::now(), TICK * 2);
+        link.maintain().await;
+        if let Ok(Ok((size, from))) = tokio::time::timeout(TICK, link.recv(&mut buffer)).await {
+            link.accept(&buffer[..size], from).await;
+        }
+    }
+
+    super::probe::tap(&mut link, 4, taps, hold).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let keyboard = mac.keyboard.as_ref().unwrap().borrow();
+    (keyboard.posts.clone(), keyboard.now())
+}
+
+#[test]
+fn taps_never_repeat_through_wifi_stalls() {
+    let (raw, raw_end) = local(type_through_stalls(false, 20, Duration::from_millis(90)));
+    let raw_repeats = simulated_repeats(&raw, 4, raw_end, REPEAT_DELAY, REPEAT_INTERVAL);
+    assert_eq!(raw_repeats.len(), 20, "every tap reached the Mac once: {raw:?}");
+    assert!(raw_repeats.iter().sum::<u64>() > 0, "the stalls never made a tap repeat, so this test proves nothing: {raw_repeats:?}");
+
+    let (leased, leased_end) = local(type_through_stalls(true, 20, Duration::from_millis(90)));
+    let repeats = simulated_repeats(&leased, 4, leased_end, REPEAT_DELAY, REPEAT_INTERVAL);
+    assert_eq!(repeats.len(), 20, "every tap reached the Mac once: {leased:?}");
+    assert!(repeats.iter().all(|count| *count == 0), "{repeats:?}");
+}
+
+#[test]
+fn a_held_key_still_repeats_through_wifi_stalls() {
+    let (posts, end) = local(type_through_stalls(true, 1, Duration::from_millis(1500)));
+    let repeats: u64 = simulated_repeats(&posts, 4, end, REPEAT_DELAY, REPEAT_INTERVAL).iter().sum();
+    assert!(repeats >= 25, "a 1.5 s hold should keep repeating between stalls: {repeats} repeats, {posts:?}");
+    assert!(posts.last().is_some_and(|(_, state)| state.keys.is_empty()), "{posts:?}");
 }

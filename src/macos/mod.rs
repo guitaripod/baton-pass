@@ -1,5 +1,6 @@
 mod display;
 pub mod install;
+mod keyrepeat;
 mod linear;
 pub mod pasteboard;
 mod vhid;
@@ -7,6 +8,7 @@ mod vhid;
 use crate::clip;
 use crate::config::{Confine, Config, Side};
 use crate::crypto::{Cipher, Counter};
+use crate::jitter::{Backlog, KeyLease, LATE_MOTION, Lateness, StallMeter};
 use crate::session::{Admission, Doorman, Silence};
 use crate::proto::{Envelope, FLAG_ENTERED, KeyState, MAX_CLIPBOARD_FRAME, Msg, read_frame, write_frame};
 use anyhow::{Context, Result, bail};
@@ -36,6 +38,9 @@ const LATE_TICK: Duration = Duration::from_millis(150);
 const PARKING_LIMIT: Duration = Duration::from_millis(500);
 const EXIT_ARM_DISTANCE: f64 = 24.0;
 const RELEASE_FLUSH: Duration = Duration::from_millis(50);
+const FALLBACK_REPEAT_DELAY: Duration = Duration::from_millis(150);
+const LINK_REPORT: Duration = Duration::from_secs(60);
+const VERSION_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A calibration in progress. It advances one step per tick, so the receive loop keeps
 /// answering while the cursor makes its out-and-back moves.
@@ -94,6 +99,15 @@ struct Receiver {
     parking: Option<(Point, Instant)>,
     displays: Vec<Rect>,
     displays_at: Option<Instant>,
+    epoch: Instant,
+    lateness: Lateness,
+    lease: KeyLease,
+    repeat_delay: u64,
+    backlog: Backlog,
+    last_playout: u64,
+    stalls: StallMeter,
+    last_link_report: Instant,
+    last_version_warning: Option<Instant>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -142,7 +156,17 @@ pub async fn run(config: Config) -> Result<()> {
         parking: None,
         displays: Vec::new(),
         displays_at: None,
+        epoch: Instant::now(),
+        lateness: Lateness::default(),
+        lease: KeyLease::default(),
+        repeat_delay: 0,
+        backlog: Backlog::default(),
+        last_playout: 0,
+        stalls: StallMeter::default(),
+        last_link_report: Instant::now(),
+        last_version_warning: None,
     };
+    receiver.read_repeat_delay();
 
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -210,7 +234,11 @@ impl Receiver {
     }
 
     async fn on_datagram(&mut self, packet: &[u8], from: SocketAddr) {
-        let Some(envelope) = self.cipher.open(packet).and_then(|plain| Envelope::decode(&plain)) else {
+        let Some(plain) = self.cipher.open(packet) else {
+            self.note_foreign_version(packet, from);
+            return;
+        };
+        let Some(envelope) = Envelope::decode(&plain) else {
             return;
         };
         let admission = self.gate.borrow_mut().doorman.admit(envelope, from);
@@ -224,6 +252,7 @@ impl Receiver {
                 let previous = self.last_packet.map(|at| format!(" (the last session's last packet came {} ms ago)", at.elapsed().as_millis()));
                 self.heard();
                 self.leave("new session");
+                self.lateness.reset();
                 tracing::info!("session with {to}{}", previous.unwrap_or_default());
                 self.reply(to, 0, welcome).await;
                 return;
@@ -232,8 +261,9 @@ impl Receiver {
             Admission::Ignore => return,
         };
         self.heard();
+        let late = stamp(&msg).map(|at| self.observe(at)).unwrap_or(0);
         match msg {
-            Msg::Heartbeat { entered, keys, buttons } => {
+            Msg::Heartbeat { entered, keys, buttons, at } => {
                 if entered && !self.entered {
                     self.entered = true;
                     tracing::info!("in control (resumed by heartbeat)");
@@ -241,8 +271,9 @@ impl Receiver {
                     self.leave("heartbeat says released");
                 }
                 if self.entered {
-                    self.apply_keys(keys);
+                    self.confirm_keys(keys, at);
                     if buttons != self.buttons && self.exiting.is_none() {
+                        self.flush_backlog();
                         self.buttons = buttons;
                         vhid::pointing(buttons, 0, 0, 0, 0);
                     }
@@ -251,26 +282,99 @@ impl Receiver {
                 if self.entered {
                     flags |= FLAG_ENTERED;
                 }
-                self.reply(from, token, Msg::Ack { flags }).await;
+                let (stalls, worst) = self.stalls.summary(self.now());
+                self.reply(from, token, Msg::Ack { flags, stalls, worst }).await;
             }
             Msg::Enter { side, frac, speed, exit } => {
                 self.exit_enabled = exit;
                 self.enter(Side::from_wire(side).unwrap_or(Side::Left), frac, speed).await;
             }
             Msg::Leave => self.leave("released"),
-            Msg::Pointer { dx, dy, wheel_v, wheel_h, buttons } => {
-                self.pointer(dx, dy, wheel_v, wheel_h, buttons).await;
+            Msg::Pointer { dx, dy, wheel_v, wheel_h, buttons, .. } => {
+                self.pointer(dx, dy, wheel_v, wheel_h, buttons, late).await;
             }
-            Msg::Keys(keys)
-                if self.entered => {
-                    self.apply_keys(keys);
-                }
+            Msg::Keys { keys, at } if self.entered => self.confirm_keys(keys, at),
             _ => {}
+        }
+    }
+
+    /// Microseconds on this side's clock, the one lateness is measured on.
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
+    }
+
+    /// Measures how late a packet stamped `at` on the desktop's clock arrived, and counts it
+    /// toward the link's stalls.
+    fn observe(&mut self, at: u64) -> u64 {
+        let now = self.now();
+        let late = self.lateness.observe(at, now);
+        self.stalls.observe(late, now);
+        late
+    }
+
+    /// Re-reads the key repeat delay the lease must stay ahead of; Keyboard settings can change
+    /// between visits.
+    fn read_repeat_delay(&mut self) {
+        let delay = keyrepeat::initial_delay().unwrap_or_else(|| {
+            tracing::warn!("could not read the key repeat delay; assuming {} ms", FALLBACK_REPEAT_DELAY.as_millis());
+            FALLBACK_REPEAT_DELAY
+        });
+        let micros = delay.as_micros() as u64;
+        if micros != self.repeat_delay {
+            tracing::info!("key repeat starts after {} ms", micros / 1000);
+            self.repeat_delay = micros;
+        }
+    }
+
+    fn confirm_keys(&mut self, keys: KeyState, at: u64) {
+        let now = self.now();
+        let desktop_now = self.lateness.desktop_now(now).unwrap_or(at);
+        let state = self.lease.confirm(keys, at, now, desktop_now, self.repeat_delay);
+        self.post_keys(state);
+    }
+
+    /// Lets go of keys the desktop has stopped vouching for before macOS would repeat them.
+    fn expire_keys(&mut self) {
+        let now = self.now();
+        if let Some(desktop_now) = self.lateness.desktop_now(now)
+            && let Some(state) = self.lease.expire(now, desktop_now, self.repeat_delay)
+        {
+            self.post_keys(state);
+        }
+    }
+
+    /// Logs, once a minute and when control goes back (`now`), how the link behaved and what
+    /// the lease did about it, whenever there is anything to say.
+    fn report_link(&mut self, now: bool) {
+        if !now && self.last_link_report.elapsed() < LINK_REPORT {
+            return;
+        }
+        self.last_link_report = Instant::now();
+        let (stalls, worst) = self.stalls.summary(self.now());
+        let (released, pressed_again) = self.lease.take_counts();
+        if stalls > 0 || released > 0 {
+            tracing::info!(
+                "link: {stalls} stalls in the last minute (worst {worst} ms late); {released} held keys let go before they could repeat, {pressed_again} pressed again"
+            );
+        }
+    }
+
+    /// Says, now and then, that the desktop speaks another wire version: one machine was
+    /// updated and the other was not, and they cannot talk until both run the same release.
+    fn note_foreign_version(&mut self, packet: &[u8], from: SocketAddr) {
+        let Some(version) = crate::crypto::foreign_version(packet) else { return };
+        if self.last_version_warning.is_none_or(|at| at.elapsed() > VERSION_WARNING_INTERVAL) {
+            self.last_version_warning = Some(Instant::now());
+            tracing::warn!(
+                "{from} speaks Baton Pass wire version {version} and this Mac speaks {}: update both machines to the same release",
+                crate::crypto::WIRE_VERSION
+            );
         }
     }
 
     async fn enter(&mut self, arch_side: Side, frac: f32, speed: f32) {
         self.release_all();
+        self.read_repeat_delay();
         self.entered = true;
         self.exiting = None;
         self.exit_armed = false;
@@ -301,6 +405,7 @@ impl Receiver {
     fn leave(&mut self, reason: &str) {
         if self.entered {
             tracing::info!("control returned ({reason})");
+            self.report_link(true);
         }
         self.entered = false;
         self.exiting = None;
@@ -308,6 +413,13 @@ impl Receiver {
     }
 
     fn release_all(&mut self) {
+        self.lease.clear();
+        self.release_devices();
+    }
+
+    /// Lets go of every key and button on the virtual devices and drops motion still waiting.
+    fn release_devices(&mut self) {
+        self.backlog.take_all();
         self.keys = KeyState::default();
         self.buttons = 0;
         vhid::keyboard(&self.keys);
@@ -315,7 +427,8 @@ impl Receiver {
         vhid::pointing(0, 0, 0, 0, 0);
     }
 
-    fn apply_keys(&mut self, keys: KeyState) {
+    /// Posts a key state, sending only the parts that changed.
+    fn post_keys(&mut self, keys: KeyState) {
         if keys.modifiers != self.keys.modifiers || keys.keys != self.keys.keys {
             vhid::keyboard(&keys);
         }
@@ -325,7 +438,10 @@ impl Receiver {
         self.keys = keys;
     }
 
-    async fn pointer(&mut self, dx: f32, dy: f32, wheel_v: i32, wheel_h: i32, buttons: u32) {
+    /// Posts motion as it arrives, except motion that comes late in a burst after a stall: that
+    /// is played out over the next few ticks so the cursor glides instead of jumping. A click
+    /// or a wheel turn first posts all motion before it, so it lands where it was aimed.
+    async fn pointer(&mut self, dx: f32, dy: f32, wheel_v: i32, wheel_h: i32, buttons: u32, late: u64) {
         if !self.entered {
             return;
         }
@@ -335,6 +451,35 @@ impl Receiver {
             }
             return;
         }
+        if wheel_v != 0 || wheel_h != 0 || buttons != self.buttons {
+            self.flush_backlog();
+        } else if late >= LATE_MOTION {
+            self.backlog.add(dx, dy);
+            return;
+        }
+        self.post_pointer(dx, dy, wheel_v, wheel_h, buttons);
+    }
+
+    fn flush_backlog(&mut self) {
+        if !self.backlog.is_empty() {
+            let (dx, dy) = self.backlog.take_all();
+            self.post_pointer(dx, dy, 0, 0, self.buttons);
+        }
+    }
+
+    /// Posts the share of late motion due since the last tick.
+    fn play_backlog(&mut self) {
+        let now = self.now();
+        let elapsed = now.saturating_sub(self.last_playout);
+        self.last_playout = now;
+        if !self.backlog.is_empty() {
+            let (dx, dy) = self.backlog.take(elapsed);
+            self.post_pointer(dx, dy, 0, 0, self.buttons);
+        }
+    }
+
+    /// Scales desktop pixels to virtual-mouse counts, keeping the fractions for the next post.
+    fn post_pointer(&mut self, dx: f32, dy: f32, wheel_v: i32, wheel_h: i32, buttons: u32) {
         let gain = (self.speed as f64 / self.points_per_count.unwrap_or(1.0)) as f32;
         self.remainder.0 += dx * gain;
         self.remainder.1 += dy * gain;
@@ -497,7 +642,8 @@ impl Receiver {
             self.leave("the desktop went quiet");
         } else if quiet > SILENCE_LIMIT && !self.quiet_released {
             self.quiet_released = true;
-            self.release_all();
+            self.lease.suspend_all();
+            self.release_devices();
             tracing::info!("desktop quiet for {} ms; keys released, still in control", quiet.as_millis());
         }
     }
@@ -506,6 +652,7 @@ impl Receiver {
         self.note_tick();
         self.settle_parking();
         self.check_silence().await;
+        self.report_link(false);
         let ready = vhid::pointing_ready();
         if ready != self.pointer_was_ready {
             self.pointer_was_ready = ready;
@@ -523,9 +670,11 @@ impl Receiver {
             }
             return;
         }
+        self.expire_keys();
         if self.exiting.is_some() {
             return;
         }
+        self.play_backlog();
         self.refresh_displays(false);
         let Some(cursor) = display::cursor() else { return };
         self.learn_ratio(cursor);
@@ -664,6 +813,14 @@ impl Receiver {
         {
             post_calibration_move(-calibration.direction);
         }
+    }
+}
+
+/// The desktop's send stamp on the messages that carry one.
+fn stamp(msg: &Msg) -> Option<u64> {
+    match msg {
+        Msg::Heartbeat { at, .. } | Msg::Pointer { at, .. } | Msg::Keys { at, .. } => Some(*at),
+        _ => None,
     }
 }
 

@@ -27,12 +27,12 @@ pub enum Msg {
     Join { nonce: u64, challenge: u64 },
     Welcome { nonce: u64, token: u64 },
     Reset { token: u64, counter: u64 },
-    Heartbeat { entered: bool, keys: KeyState, buttons: u32 },
-    Ack { flags: u8 },
+    Heartbeat { entered: bool, keys: KeyState, buttons: u32, at: u64 },
+    Ack { flags: u8, stalls: u16, worst: u16 },
     Enter { side: u8, frac: f32, speed: f32, exit: bool },
     Leave,
-    Pointer { dx: f32, dy: f32, wheel_v: i32, wheel_h: i32, buttons: u32 },
-    Keys(KeyState),
+    Pointer { dx: f32, dy: f32, wheel_v: i32, wheel_h: i32, buttons: u32, at: u64 },
+    Keys { keys: KeyState, at: u64 },
     Exit { frac: f32 },
     ClipPut { clip: Clip },
     ClipGet { have: [u8; 32] },
@@ -67,15 +67,18 @@ impl Envelope {
                 out.extend_from_slice(&token.to_le_bytes());
                 out.extend_from_slice(&counter.to_le_bytes());
             }
-            Msg::Heartbeat { entered, keys, buttons } => {
+            Msg::Heartbeat { entered, keys, buttons, at } => {
                 out.push(3);
                 out.push(u8::from(*entered));
                 put_keys(&mut out, keys);
                 out.extend_from_slice(&buttons.to_le_bytes());
+                out.extend_from_slice(&at.to_le_bytes());
             }
-            Msg::Ack { flags } => {
+            Msg::Ack { flags, stalls, worst } => {
                 out.push(4);
                 out.push(*flags);
+                out.extend_from_slice(&stalls.to_le_bytes());
+                out.extend_from_slice(&worst.to_le_bytes());
             }
             Msg::Enter { side, frac, speed, exit } => {
                 out.push(5);
@@ -85,17 +88,19 @@ impl Envelope {
                 out.push(u8::from(*exit));
             }
             Msg::Leave => out.push(6),
-            Msg::Pointer { dx, dy, wheel_v, wheel_h, buttons } => {
+            Msg::Pointer { dx, dy, wheel_v, wheel_h, buttons, at } => {
                 out.push(7);
                 out.extend_from_slice(&dx.to_le_bytes());
                 out.extend_from_slice(&dy.to_le_bytes());
                 out.extend_from_slice(&wheel_v.to_le_bytes());
                 out.extend_from_slice(&wheel_h.to_le_bytes());
                 out.extend_from_slice(&buttons.to_le_bytes());
+                out.extend_from_slice(&at.to_le_bytes());
             }
-            Msg::Keys(keys) => {
+            Msg::Keys { keys, at } => {
                 out.push(8);
                 put_keys(&mut out, keys);
+                out.extend_from_slice(&at.to_le_bytes());
             }
             Msg::Exit { frac } => {
                 out.push(9);
@@ -144,8 +149,9 @@ impl Envelope {
                 entered: reader.u8()? != 0,
                 keys: reader.keys()?,
                 buttons: reader.u32()?,
+                at: reader.u64()?,
             },
-            4 => Msg::Ack { flags: reader.u8()? },
+            4 => Msg::Ack { flags: reader.u8()?, stalls: reader.u16()?, worst: reader.u16()? },
             5 => Msg::Enter { side: reader.u8()?, frac: reader.f32()?, speed: reader.f32()?, exit: reader.u8()? != 0 },
             6 => Msg::Leave,
             7 => Msg::Pointer {
@@ -154,8 +160,9 @@ impl Envelope {
                 wheel_v: reader.i32()?,
                 wheel_h: reader.i32()?,
                 buttons: reader.u32()?,
+                at: reader.u64()?,
             },
-            8 => Msg::Keys(reader.keys()?),
+            8 => Msg::Keys { keys: reader.keys()?, at: reader.u64()? },
             9 => Msg::Exit { frac: reader.f32()? },
             16 => Msg::ClipPut { clip: crate::clip::decode(reader.blob()?)? },
             11 => Msg::ClipGet { have: reader.take(32)?.try_into().ok()? },
@@ -284,12 +291,12 @@ mod tests {
         round_trip(Msg::Challenge { nonce: 7, challenge: 11 });
         round_trip(Msg::Join { nonce: 7, challenge: 11 });
         round_trip(Msg::Reset { token: 9, counter: 12 });
-        round_trip(Msg::Heartbeat { entered: true, keys: keys.clone(), buttons: 5 });
-        round_trip(Msg::Ack { flags: FLAG_ENTERED | FLAG_POINTING_READY });
+        round_trip(Msg::Heartbeat { entered: true, keys: keys.clone(), buttons: 5, at: 1_234_567 });
+        round_trip(Msg::Ack { flags: FLAG_ENTERED | FLAG_POINTING_READY, stalls: 112, worst: 141 });
         round_trip(Msg::Enter { side: 0, frac: 0.25, speed: 1.5, exit: true });
         round_trip(Msg::Leave);
-        round_trip(Msg::Pointer { dx: -3.5, dy: 2.25, wheel_v: -120, wheel_h: 60, buttons: 1 });
-        round_trip(Msg::Keys(keys));
+        round_trip(Msg::Pointer { dx: -3.5, dy: 2.25, wheel_v: -120, wheel_h: 60, buttons: 1, at: 99 });
+        round_trip(Msg::Keys { keys, at: u64::MAX });
         round_trip(Msg::Exit { frac: 0.5 });
         round_trip(Msg::ClipPut { clip: vec![("text/html".into(), "<i>hej</i>".into()), ("text/plain;charset=utf-8".into(), "hej".into())] });
         round_trip(Msg::ClipGet { have: [5; 32] });
@@ -308,8 +315,8 @@ mod tests {
 
     #[test]
     fn rejects_oversized_key_lists() {
-        let mut encoded = Envelope { token: 1, counter: 2, msg: Msg::Keys(KeyState::default()) }.encode();
-        let count_index = encoded.len() - 2;
+        let mut encoded = Envelope { token: 1, counter: 2, msg: Msg::Keys { keys: KeyState::default(), at: 0 } }.encode();
+        let count_index = encoded.len() - 10;
         encoded[count_index] = (MAX_KEYS + 1) as u8;
         assert!(Envelope::decode(&encoded).is_none());
     }
