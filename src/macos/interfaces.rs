@@ -3,7 +3,7 @@
 //! the tailnet) even when its config names an address the Mac no longer has.
 
 use crate::proto::{MAX_ADDRESSES, Medium};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -17,13 +17,20 @@ const PORTS_REFRESH: Duration = Duration::from_secs(30);
 pub struct Interfaces {
     ports: Rc<RefCell<HashMap<String, String>>>,
     ports_read: Option<Instant>,
+    ports_known: Rc<Cell<bool>>,
 }
 
 impl Interfaces {
     pub fn new() -> Self {
-        let mut interfaces = Self { ports: Rc::new(RefCell::new(HashMap::new())), ports_read: None };
+        let mut interfaces =
+            Self { ports: Rc::new(RefCell::new(HashMap::new())), ports_read: None, ports_known: Rc::new(Cell::new(false)) };
         interfaces.read_ports();
         interfaces
+    }
+
+    /// Whether the hardware ports have been read once, so mediums can be told apart.
+    pub fn ready(&self) -> bool {
+        self.ports_known.get()
     }
 
     /// Every usable address with its medium, listening on `port`, in a stable order.
@@ -43,12 +50,13 @@ impl Interfaces {
 
     fn read_ports(&mut self) {
         self.ports_read = Some(Instant::now());
-        let ports = self.ports.clone();
+        let (ports, known) = (self.ports.clone(), self.ports_known.clone());
         tokio::task::spawn_local(async move {
             match tokio::process::Command::new("/usr/sbin/networksetup").arg("-listallhardwareports").output().await {
                 Ok(output) => *ports.borrow_mut() = parse_ports(&String::from_utf8_lossy(&output.stdout)),
                 Err(error) => tracing::warn!("listing hardware ports: {error}"),
             }
+            known.set(true);
         });
     }
 }

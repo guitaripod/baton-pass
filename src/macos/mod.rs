@@ -374,9 +374,11 @@ impl Receiver {
     }
 
     /// Tells the desktop which addresses this Mac has, right after a handshake (`force`), when
-    /// they change, and every half minute in case a report was lost.
+    /// they change, and every half minute in case a report was lost. Unforced reports wait
+    /// until the hardware ports are known, so Wi-Fi is never first reported as something else.
     async fn advertise(&mut self, force: bool) {
-        if !force && self.addresses_checked.is_some_and(|at| at.elapsed() < ADDRESS_CHECK) {
+        let checked_lately = self.addresses_checked.is_some_and(|at| at.elapsed() < ADDRESS_CHECK);
+        if !force && (checked_lately || !self.interfaces.ready()) {
             return;
         }
         self.addresses_checked = Some(Instant::now());
